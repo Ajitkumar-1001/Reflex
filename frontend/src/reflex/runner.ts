@@ -22,11 +22,16 @@ import type {
   TerminalState,
 } from "./contracts";
 import { admitTask } from "./admission";
+import { ApprovalAborted } from "./approval";
+import type { ApprovalService } from "./approval";
 import { WriteGate } from "./gate";
+import { effectKey } from "./ledger";
+import type { SideEffectLedger } from "./ledger";
 import type { GateConfig } from "./gate";
 import { LiveRecords } from "./live-records";
 import { MemoryService } from "./memory-service";
 import { authorizeToolCall, checkToolAccess } from "./permission";
+import { actionRequiresApproval, dispatchEffect } from "./tool-runner";
 import type { ToolRegistry } from "./permission";
 import {
   EmbedderUnavailableError,
@@ -139,6 +144,16 @@ export interface RunnerDeps {
   random?: () => number;
   /** Absent: memory is disabled whatever the policy says, and a policy that enables it is blocked. */
   memory?: MemoryRuntime;
+  /**
+   * Phase 2 side effects. Absent: external writes stay denied and the trace matches the memory-off
+   * baseline. Present: mutations are ledgered before they run, and an action that requires approval pauses.
+   */
+  effects?: EffectRuntime;
+}
+
+export interface EffectRuntime {
+  ledger: SideEffectLedger;
+  approvals: ApprovalService;
 }
 
 const PERSIST_ATTEMPTS = 3; // PRD §7.8: persistence retries 3 times
@@ -170,7 +185,8 @@ export class ReferenceRunner implements RunEngine {
     const modelTimeoutMs = this.deps.modelTimeoutMs ?? DEFAULT_MODEL_TIMEOUT_MS;
     const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     const random = this.deps.random ?? Math.random;
-    const admission = admitTask(request.task, request.policy, registry);
+    const effects = this.deps.effects;
+    const admission = admitTask(request.task, request.policy, registry, { externalWrites: effects ? "defer" : "deny" });
     if (!admission.ok) return { admitted: false, issues: admission.issues };
     const { task, policy } = admission;
 
@@ -379,6 +395,8 @@ export class ReferenceRunner implements RunEngine {
       }
     };
 
+    const accessContext = { task, policy, registry, externalWrite: effects ? ("defer" as const) : ("deny" as const) };
+
     const drive = async (): Promise<void> => {
       moveTo("ADMITTED", "task admitted");
       const memory = this.deps.memory;
@@ -449,11 +467,14 @@ export class ReferenceRunner implements RunEngine {
         );
       }
       for (const tool of plan.tools) {
-        const access = checkToolAccess(tool, { task, policy, registry });
+        const access = checkToolAccess(tool, accessContext);
         if ("denial" in access) {
           emit("policy_denied", system, { callId: null, tool: tool.slice(0, 100), ...access.denial });
           const reason = access.denial.reasonCode === "external_write_not_permitted" ? "approval_required_p0" : "policy_denied";
           throw new Stop("BLOCKED", "blocked", reason, `plan needs ${tool}: ${access.denial.reasonCode}`);
+        }
+        if (!effects && actionRequiresApproval(access.tool, policy.approvalRequirements)) {
+          throw new Stop("BLOCKED", "blocked", "approval_required_p0", `plan needs approval for ${tool}, and no approval workflow is configured`);
         }
       }
       emit("plan_recorded", modelActor, { plan });
@@ -473,7 +494,7 @@ export class ReferenceRunner implements RunEngine {
         );
         run.steps++;
         const callId = ids.next("call");
-        const decision = authorizeToolCall(call, { task, policy, registry });
+        const decision = authorizeToolCall(call, accessContext);
 
         if (!decision.allowed) {
           emit("policy_denied", modelActor, {
@@ -490,26 +511,109 @@ export class ReferenceRunner implements RunEngine {
         }
 
         const name = decision.tool.descriptor.name;
-        emit("tool_authorized", modelActor, { callId, tool: name, argsSummary: JSON.stringify(call.args).slice(0, 200) });
-        const startedMs = clock.now().getTime();
+        const argsSummary = JSON.stringify(decision.args).slice(0, 200);
+        if (!effects && actionRequiresApproval(decision.tool, policy.approvalRequirements)) {
+          throw new Stop("BLOCKED", "blocked", "approval_required_p0", `${name} requires approval, and no approval workflow is configured`);
+        }
+
         let output: ToolOutput;
         let infraFailure: InfraFailureError | null = null;
-        try {
-          output = await withTimeout(
-            decision.tool.execute(decision.args, { workspace, scope: task.scope, commands, artifacts }),
-            decision.tool.descriptor.timeoutMs,
-          );
-        } catch (error) {
-          if (error instanceof InfraFailureError) infraFailure = error;
-          output =
-            error instanceof InfraFailureError
-              ? { ok: false, summary: "sandbox unavailable", observation: error.message }
-              : error instanceof TimedOut
-              ? { ok: false, summary: "tool timed out", observation: `${name} timed out after ${decision.tool.descriptor.timeoutMs} ms` }
-              : { ok: false, summary: "tool raised an error", observation: error instanceof Error ? error.message : "tool error" };
+        let effectKeyForEvent: string | undefined;
+        let startedMs: number;
+        if (effects) {
+          let approvalId: string | null = null;
+          if (actionRequiresApproval(decision.tool, policy.approvalRequirements)) {
+            const idempotencyKey = effectKey(runId, run.steps, name, decision.args).key;
+            const approval = effects.approvals.request({
+              runId,
+              taskId: task.id,
+              step: run.steps,
+              tool: name,
+              argsSummary,
+              idempotencyKey,
+              scope: {
+                tenantId: task.tenantId,
+                projectId: task.projectId,
+                repo: task.scope.repo,
+                commit: task.scope.commit,
+                ...(task.scope.paths ? { paths: [...task.scope.paths] } : {}),
+              },
+              requestedBy: task.requestedBy,
+            });
+            approvalId = approval.id;
+            moveTo("AWAITING_APPROVAL", `approval required for ${name}`);
+            try {
+              const resolved = await effects.approvals.wait(approval.id, request.signal);
+              if (resolved.status !== "approved") {
+                const reason = resolved.status === "expired" ? "approval_expired" : "approval_denied";
+                throw new Stop("BLOCKED", "blocked", reason, resolved.reason ?? reason);
+              }
+              moveTo("EXECUTING", `approval granted by ${resolved.decidedBy} for ${name}`);
+              checkLimits();
+            } catch (error) {
+              if (error instanceof ApprovalAborted) {
+                effects.approvals.failClosed(approval.id, "run cancelled while awaiting approval");
+                const shutdown = request.signal?.reason === "shutdown";
+                throw new Stop(
+                  "CANCELLED",
+                  "cancelled",
+                  shutdown ? "shutdown" : "user_cancel",
+                  shutdown ? "process shutting down" : "cancellation requested",
+                );
+              }
+              throw error;
+            }
+          }
+
+          startedMs = clock.now().getTime();
+          const dispatched = await dispatchEffect({
+            runId,
+            step: run.steps,
+            tool: decision.tool,
+            args: decision.args,
+            ctx: { workspace, scope: task.scope, commands, artifacts },
+            ledger: effects.ledger,
+            grants: effects.approvals.store,
+            approvalId,
+            approvalMarks: policy.approvalRequirements,
+            clock,
+            timeoutMs: decision.tool.descriptor.timeoutMs,
+          });
+          if (dispatched.kind === "blocked") {
+            const reason =
+              dispatched.reason === "approval_expired" ? "approval_expired" : dispatched.reason === "approval_denied" ? "approval_denied" : "approval_required_p0";
+            throw new Stop("BLOCKED", "blocked", reason, `unapproved ${name}: ${dispatched.reason}`);
+          }
+          if (dispatched.kind === "replayed") {
+            output = dispatched.output ?? { ok: false, summary: `effect ${dispatched.state}`, observation: "not executed again" };
+            effectKeyForEvent = dispatched.key;
+          } else {
+            output = dispatched.output;
+            infraFailure = dispatched.infraFailure;
+            effectKeyForEvent = dispatched.key ?? undefined;
+          }
+          emit("tool_authorized", modelActor, { callId, tool: name, argsSummary });
+        } else {
+          emit("tool_authorized", modelActor, { callId, tool: name, argsSummary });
+          startedMs = clock.now().getTime();
+          try {
+            output = await withTimeout(
+              decision.tool.execute(decision.args, { workspace, scope: task.scope, commands, artifacts }),
+              decision.tool.descriptor.timeoutMs,
+            );
+          } catch (error) {
+            if (error instanceof InfraFailureError) infraFailure = error;
+            output =
+              error instanceof InfraFailureError
+                ? { ok: false, summary: "sandbox unavailable", observation: error.message }
+                : error instanceof TimedOut
+                  ? { ok: false, summary: "tool timed out", observation: `${name} timed out after ${decision.tool.descriptor.timeoutMs} ms` }
+                  : { ok: false, summary: "tool raised an error", observation: error instanceof Error ? error.message : "tool error" };
+          }
+          effectKeyForEvent = decision.tool.descriptor.sideEffect === "read_only" ? undefined : `${runId}:${callId}`;
         }
         const durationMs = Math.max(0, clock.now().getTime() - startedMs);
-        const key = decision.tool.descriptor.sideEffect === "read_only" ? undefined : `${runId}:${callId}`;
+        const key = effectKeyForEvent;
         emit(
           "tool_result",
           { kind: "tool", id: name },

@@ -57,6 +57,27 @@ describe("authorizeToolCall (FR-06, INV-02, INV-08)", () => {
     );
   });
 
+  it("defers an allowlisted external write to approval, and still refuses one that is not allowlisted or an investigation", () => {
+    const postComment = defineTool({
+      name: "post_comment",
+      description: "post a comment",
+      inputSchema: z.strictObject({ body: z.string() }),
+      sideEffect: "external_write",
+      idempotent: false,
+      run: () => ({ ok: true, summary: "posted", observation: "posted" }),
+    });
+    const registry = new ToolRegistry("test", [...createStubTools(), postComment]);
+    const policy = { ...FIXTURE_POLICY, toolAllowlist: [...FIXTURE_POLICY.toolAllowlist, "post_comment"] };
+    const defer = { externalWrite: "defer" as const };
+    expect(reasonOf(authorizeToolCall(call("post_comment", { body: "hi" }), { ...ctx(FIXTURE_TASK, policy, registry), ...defer }))).toBe("allowed");
+    expect(reasonOf(authorizeToolCall(call("post_comment", { body: "hi" }), { ...ctx(FIXTURE_TASK, FIXTURE_POLICY, registry), ...defer }))).toBe(
+      "tool_not_in_policy",
+    );
+    expect(reasonOf(authorizeToolCall(call("post_comment", { body: "hi" }), { ...ctx(investigationTask(), policy, registry), ...defer }))).toBe(
+      "write_in_investigation_mode",
+    );
+  });
+
   it("denies malformed or unexpected arguments", () => {
     expect(reasonOf(authorizeToolCall(call("read_file", { path: 5 }), ctx()))).toBe("invalid_arguments");
     expect(reasonOf(authorizeToolCall(call("read_file", { path: "src/add.ts", sudo: true }), ctx()))).toBe("invalid_arguments");
