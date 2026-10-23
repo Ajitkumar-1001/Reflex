@@ -105,6 +105,10 @@ gained its integrity fields). The diff of each is in git history.
   definitions, not code, until checks run from a container image (DEC-02).
 - Per-tool timeouts other than `run_command`'s, the jitter width (±25%), and what `read_file` does past 400
   lines or 64 KB (truncates, with a marker) are not specified.
+- A procedural `MemoryCandidate` is rejected for `hypothesis` or `rejected` evidence only (INV-03: "an
+  untested hypothesis is not a reusable procedure"). The v1.0-era code also rejected `inferred`; v1.4 does
+  not say so, and whether an inferred lesson may become a procedure is the write gate's call (§9.3 check 2).
+  Single-run confidence <= 0.5 (§9.3) is likewise gate behaviour, not a schema rule.
 - An investigation run has no checks, so its evaluation is `inconclusive/missing_checks`; and `run_command`
   (a `workspace_write` tool) is unavailable to it.
 
