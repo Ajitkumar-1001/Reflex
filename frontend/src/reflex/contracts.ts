@@ -246,6 +246,18 @@ export type DenialReason = z.infer<typeof DenialReason>;
 
 // ---------------------------------------------------------------------- policy
 
+/** PRD §11 default `run_command` allowlist, as argv prefixes: git only with read-only subcommands. */
+export const DEFAULT_COMMAND_ALLOWLIST: readonly (readonly string[])[] = [
+  ["npm"],
+  ["pnpm"],
+  ["npx", "tsc"],
+  ["node"],
+  ["git", "status"],
+  ["git", "diff"],
+  ["git", "log"],
+  ["git", "show"],
+];
+
 export const PolicySchema = z.strictObject({
   id: Id,
   name: NonEmpty,
@@ -406,7 +418,14 @@ export const EventSchema = z.discriminatedUnion("type", [
   ),
   eventVariant(
     "tool_result",
-    z.strictObject({ callId: Id, tool: NonEmpty, ok: z.boolean(), summary: z.string(), durationMs: z.int().nonnegative() }),
+    z.strictObject({
+      callId: Id,
+      tool: NonEmpty,
+      ok: z.boolean(),
+      summary: z.string(),
+      durationMs: z.int().nonnegative(),
+      exitStatus: z.int().optional(),
+    }),
   ),
   eventVariant(
     "model_output_invalid",

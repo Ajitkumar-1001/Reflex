@@ -14,6 +14,11 @@ export function isWithin(path: string, root: string): boolean {
   return normalizedRoot === "." || path === normalizedRoot || path.startsWith(`${normalizedRoot}/`);
 }
 
+/** Whether the task's `scope.paths` (absent = the whole worktree) covers a normalized path. */
+export function isInScope(path: string, scope: ProtectionScope): boolean {
+  return scope.paths === undefined || scope.paths.some((root) => isWithin(path, root));
+}
+
 /*
  * Default protected paths. PRD §11 names the categories (test directories, CI config, lint/type
  * config, evaluator scripts, lockfiles); these patterns are one concrete reading of them.

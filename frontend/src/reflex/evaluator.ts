@@ -1,20 +1,20 @@
 import { canTransition, isTerminal, taskChecks } from "./contracts";
 import type { EvaluationResult, RunEvent, RunState } from "./contracts";
-import type { CheckSet, Evaluator } from "./ports";
+import type { CommandTable, Evaluator } from "./ports";
 
 /**
- * Deterministic evaluator (INV-01, INV-09). The verdict comes only from executable
- * checks over the final workspace; the agent's own claim is never an input.
+ * Deterministic evaluator (INV-01, INV-09). The verdict comes only from executing each check's
+ * command against a copy of the final workspace; the agent's own claim is never an input.
  */
 export class CheckEvaluator implements Evaluator {
   readonly version = "check-evaluator-p0";
 
-  constructor(private readonly checks: CheckSet) {}
+  constructor(private readonly commands: CommandTable) {}
 
   evaluate: Evaluator["evaluate"] = ({ evaluationId, runId, task, workspace, completedAt }) => {
     const results = taskChecks(task).map(({ name, command }) => {
-      const check = this.checks[name];
-      return { name, command, passed: check ? check(workspace) : null };
+      const run = this.commands[command];
+      return { name, command, passed: run ? run(workspace.clone()).exitCode === 0 : null };
     });
     const base = {
       id: evaluationId,

@@ -1,10 +1,11 @@
-import { InMemoryWorkspace, ScriptedModel, SequentialIds, SteppingClock, createStubTools } from "./adapters";
+import { InMemoryArtifactStore, InMemoryWorkspace, ScriptedModel, SequentialIds, SteppingClock, createStubTools } from "./adapters";
 import type { ModelScript } from "./adapters";
 import { CheckEvaluator } from "./evaluator";
 import { ToolRegistry } from "./permission";
 import { createTask } from "./admission";
+import { DEFAULT_COMMAND_ALLOWLIST } from "./contracts";
 import type { CreateTask, Plan, Policy, Task } from "./contracts";
-import type { CheckSet, EventSink, ModelAdapter, RunResult } from "./ports";
+import type { CommandTable, EventSink, ModelAdapter, RunResult } from "./ports";
 import { ReferenceRunner } from "./runner";
 
 /*
@@ -19,9 +20,16 @@ export const FIXTURE_FILES: Readonly<Record<string, string>> = {
 
 export const FIXED_ADD_SOURCE = "export const add = (a: number, b: number): number => a + b;\n";
 
-export const FIXTURE_CHECKS: CheckSet = {
-  add_returns_sum: (ws) => ws.read("src/add.ts")?.includes("a + b") === true,
-  tests_unchanged: (ws) => ws.read("tests/add.test.ts") === FIXTURE_FILES["tests/add.test.ts"],
+/** The fixture's commands, keyed by argv. The first two are also the task's `doneWhen` checks. */
+export const FIXTURE_COMMANDS: CommandTable = {
+  "pnpm test": (ws) =>
+    ws.read("src/add.ts")?.includes("a + b") === true
+      ? { exitCode: 0, output: "1 passed" }
+      : { exitCode: 1, output: "FAIL tests/add.test.ts: expected add(2, 3) to be 5" },
+  "git diff --exit-code -- tests": (ws) =>
+    ws.read("tests/add.test.ts") === FIXTURE_FILES["tests/add.test.ts"]
+      ? { exitCode: 0, output: "" }
+      : { exitCode: 1, output: "tests/ changed" },
 };
 
 export const FIXTURE_POLICY: Policy = {
@@ -30,8 +38,8 @@ export const FIXTURE_POLICY: Policy = {
   version: 1,
   status: "ACTIVE",
   riskClass: "low",
-  toolAllowlist: ["list_files", "read_file", "write_file", "run_check", "finish"],
-  commandAllowlist: [],
+  toolAllowlist: ["list_files", "read_file", "search_code", "write_file", "apply_patch", "run_command", "finish"],
+  commandAllowlist: DEFAULT_COMMAND_ALLOWLIST.map((entry) => [...entry]),
   routingPreferences: {},
   memoryRules: { retrievalEnabled: false, writebackEnabled: false },
   budgets: { maxSteps: 40, maxUsd: 1, maxWallMinutes: 30 }, // PRD §7.8 policy defaults
@@ -49,8 +57,8 @@ export const FIXTURE_CREATE_TASK: CreateTask = {
   scope: { repo: "fixture/fix-add-bug", commit: "fixture-commit-1" },
   doneWhen: {
     checks: [
-      { name: "add_returns_sum", command: "check:add_returns_sum" },
-      { name: "tests_unchanged", command: "check:tests_unchanged" },
+      { name: "add_returns_sum", command: "pnpm test" },
+      { name: "tests_unchanged", command: "git diff --exit-code -- tests" },
     ],
   },
   riskClass: "low",
@@ -87,20 +95,20 @@ export const FIXTURE_PLAN: Plan = {
   steps: [
     { description: "read src/add.ts", tool: "read_file" },
     { description: "write the corrected implementation", tool: "write_file" },
-    { description: "run the sum check", tool: "run_check" },
+    { description: "run the tests", tool: "run_command" },
     { description: "finish", tool: "finish" },
   ],
-  tools: ["read_file", "write_file", "run_check", "finish"],
+  tools: ["read_file", "write_file", "run_command", "finish"],
   stopConditions: ["finish is called"],
   memoryIds: [],
-  verificationCommands: ["check:add_returns_sum"],
+  verificationCommands: ["pnpm test"],
   expectedArtifacts: ["src/add.ts"],
 };
 
 export const SOLUTION_STEPS: readonly unknown[] = [
   { tool: "read_file", args: { path: "src/add.ts" } },
   { tool: "write_file", args: { path: "src/add.ts", content: FIXED_ADD_SOURCE } },
-  { tool: "run_check", args: { checkId: "add_returns_sum" } },
+  { tool: "run_command", args: { argv: ["pnpm", "test"] } },
   { tool: "finish", args: { summary: "fixed add", claimedOutcome: "done" } },
 ];
 
@@ -113,7 +121,7 @@ export function fixtureRegistry(): ToolRegistry {
 }
 
 export function fixtureEvaluator(): CheckEvaluator {
-  return new CheckEvaluator(FIXTURE_CHECKS);
+  return new CheckEvaluator(FIXTURE_COMMANDS);
 }
 
 /** The scripted model that solves the fixture. Pass different `steps` for failure variants. */
@@ -127,6 +135,7 @@ export interface FixtureRunOptions {
   task?: unknown;
   policy?: unknown;
   registry?: ToolRegistry;
+  commands?: CommandTable;
   signal?: AbortSignal;
   sink?: EventSink;
 }
@@ -141,7 +150,8 @@ export function runFixture(options: FixtureRunOptions = {}): Promise<RunResult> 
     registry: options.registry ?? fixtureRegistry(),
     evaluator: fixtureEvaluator(),
     workspace: fixtureWorkspace(),
-    checks: FIXTURE_CHECKS,
+    commands: options.commands ?? FIXTURE_COMMANDS,
+    artifacts: new InMemoryArtifactStore(),
     clock: new SteppingClock(Date.UTC(2026, 0, 1), 10),
     ids: new SequentialIds(),
     sink: options.sink,

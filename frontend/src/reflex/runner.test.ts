@@ -73,11 +73,12 @@ describe("Phase 0 exit gate: deterministic fixture", () => {
     expect(r.startWorkspaceHash).not.toBe(r.endWorkspaceHash);
   });
 
-  it("keys workspace writes for idempotency and leaves reads unkeyed", async () => {
+  it("keys workspace-writing calls for idempotency and leaves reads unkeyed", async () => {
     const { events } = await run();
     const results = events.filter((e) => e.type === "tool_result");
     expect(results.filter((e) => e.idempotencyKey !== undefined).map((e) => e.type === "tool_result" && e.redactedPayload.tool)).toEqual([
       "write_file",
+      "run_command",
     ]);
   });
 

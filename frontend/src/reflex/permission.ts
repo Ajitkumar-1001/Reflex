@@ -1,6 +1,6 @@
-import type { DenialReason, Policy, Task, ToolCallRequest } from "./contracts";
-import { isProtectedPath, isWithin, normalizePath } from "./paths";
-import type { ToolAdapter } from "./ports";
+import type { Policy, Task, ToolCallRequest } from "./contracts";
+import { isInScope, isProtectedPath, normalizePath } from "./paths";
+import type { Denial, ToolAdapter } from "./ports";
 
 /** Registry of tools by name. A tool that is not here does not exist (INV-08). */
 export class ToolRegistry {
@@ -23,8 +23,6 @@ export interface AccessContext {
   policy: Policy;
   registry: ToolRegistry;
 }
-
-export type Denial = { reasonCode: DenialReason; detail: string };
 
 /** Argument-independent checks, shared by plan validation and per-call authorization. */
 export function checkToolAccess(
@@ -66,12 +64,14 @@ export function authorizeToolCall(call: ToolCallRequest, ctx: AccessContext): Au
   const writes = tool.descriptor.sideEffect === "workspace_write";
   for (const raw of tool.descriptor.touchedPaths(parsed.data)) {
     const path = normalizePath(raw);
-    if (path === null || (scope.paths !== undefined && !scope.paths.some((root) => isWithin(path, root)))) {
+    if (path === null || !isInScope(path, scope)) {
       return { allowed: false, reasonCode: "path_outside_scope", detail: `path ${JSON.stringify(raw)} is outside the task scope` };
     }
     if (writes && isProtectedPath(path, scope)) {
       return { allowed: false, reasonCode: "protected_path", detail: `path ${path} is protected` };
     }
   }
+  const denied = tool.descriptor.denyArgs?.(parsed.data, ctx.policy);
+  if (denied) return { allowed: false, ...denied };
   return { allowed: true, tool, args: parsed.data };
 }

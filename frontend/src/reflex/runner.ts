@@ -26,8 +26,9 @@ import { authorizeToolCall, checkToolAccess } from "./permission";
 import type { ToolRegistry } from "./permission";
 import { ModelUnavailableError } from "./ports";
 import type {
-  CheckSet,
+  ArtifactStore,
   Clock,
+  CommandTable,
   EventSink,
   Evaluator,
   IdGenerator,
@@ -68,7 +69,8 @@ export interface RunnerDeps {
   evaluator: Evaluator;
   /** Fresh per run: the runner mutates it through tools. */
   workspace: Workspace;
-  checks: CheckSet;
+  commands: CommandTable;
+  artifacts: ArtifactStore;
   clock: Clock;
   ids: IdGenerator;
   sink?: EventSink;
@@ -93,7 +95,7 @@ export class ReferenceRunner implements RunEngine {
   constructor(private readonly deps: RunnerDeps) {}
 
   async execute(request: RunRequest): Promise<RunResult> {
-    const { model, registry, evaluator, workspace, checks, clock, ids, sink } = this.deps;
+    const { model, registry, evaluator, workspace, commands, artifacts, clock, ids, sink } = this.deps;
     const admission = admitTask(request.task, request.policy, registry);
     if (!admission.ok) return { admitted: false, issues: admission.issues };
     const { task, policy } = admission;
@@ -131,7 +133,7 @@ export class ReferenceRunner implements RunEngine {
       type: T,
       actor: Actor,
       payload: EventOf<T>["redactedPayload"],
-      idempotencyKey?: string,
+      extra: { idempotencyKey?: string; artifactRef?: string } = {},
     ): RunEvent => {
       const event = EventSchema.parse({
         id: ids.next("evt"),
@@ -141,7 +143,7 @@ export class ReferenceRunner implements RunEngine {
         timestamp: clock.now().toISOString(),
         type,
         redactedPayload: payload,
-        ...(idempotencyKey ? { idempotencyKey } : {}),
+        ...extra,
       });
       events.push(event);
       sink?.append(event);
@@ -248,13 +250,18 @@ export class ReferenceRunner implements RunEngine {
         const startedMs = clock.now().getTime();
         let output: ToolOutput;
         try {
-          output = await decision.tool.execute(decision.args, { workspace, checks });
+          output = await decision.tool.execute(decision.args, { workspace, scope: task.scope, commands, artifacts });
         } catch (error) {
           output = { ok: false, summary: "tool raised an error", observation: error instanceof Error ? error.message : "tool error" };
         }
         const durationMs = Math.max(0, clock.now().getTime() - startedMs);
         const key = decision.tool.descriptor.sideEffect === "read_only" ? undefined : `${runId}:${callId}`;
-        emit("tool_result", { kind: "tool", id: name }, { callId, tool: name, ok: output.ok, summary: output.summary, durationMs }, key);
+        emit(
+          "tool_result",
+          { kind: "tool", id: name },
+          { callId, tool: name, ok: output.ok, summary: output.summary, durationMs, ...(output.exitStatus !== undefined ? { exitStatus: output.exitStatus } : {}) },
+          { ...(key ? { idempotencyKey: key } : {}), ...(output.artifactRef ? { artifactRef: output.artifactRef } : {}) },
+        );
         observations.push({ callId, tool: name, ok: output.ok, text: output.observation });
         finished = decision.tool.descriptor.endsExecution;
       }

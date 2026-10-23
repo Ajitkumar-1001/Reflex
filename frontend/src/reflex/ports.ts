@@ -1,11 +1,14 @@
 import type { z } from "zod";
 import type {
+  DenialReason,
   EvaluationResult,
   Plan,
+  Policy,
   Run,
   RunEvent,
   SideEffectClass,
   Task,
+  TaskScope,
 } from "./contracts";
 
 /*
@@ -28,12 +31,26 @@ export interface Workspace {
   read(path: string): string | undefined;
   write(path: string, content: string): void;
   hash(): string;
+  /** An independent copy, so a check can run against the final state without being able to change it. */
+  clone(): Workspace;
 }
 
-export type WorkspaceReader = Pick<Workspace, "list" | "read">;
+export interface CommandResult {
+  exitCode: number;
+  output: string;
+}
 
-/** A deterministic check over the final workspace. `checkId` in a task's `doneWhen` resolves here. */
-export type CheckSet = Readonly<Record<string, (workspace: WorkspaceReader) => boolean>>;
+/**
+ * Stand-in for a sandboxed process (DEC-02), keyed by the space-joined argv. `run_command` and the
+ * task's `doneWhen` checks both resolve through it; a handler may mutate the workspace it is given.
+ */
+export type CommandTable = Readonly<Record<string, (workspace: Workspace) => CommandResult>>;
+
+/** Large tool output is stored by content hash and referenced from the event (PRD §10, §11). Retention is DEC-05. */
+export interface ArtifactStore {
+  /** Returns the `sha256:<hex>` reference. */
+  put(content: string): string;
+}
 
 // ------------------------------------------------------------------- model
 
@@ -96,13 +113,20 @@ export interface ToolDescriptor {
   readonly timeoutMs: number;
   readonly idempotent: boolean;
   readonly endsExecution: boolean;
+  readonly outputSchema: z.ZodType<ToolOutput>;
   /** Workspace paths the call would touch, from already-validated arguments. */
   touchedPaths(args: unknown): string[];
+  /** Argument-dependent policy check that the input schema cannot express, e.g. the command allowlist. */
+  denyArgs?(args: unknown, policy: Policy): Denial | null;
 }
+
+export type Denial = { reasonCode: DenialReason; detail: string };
 
 export interface ToolContext {
   workspace: Workspace;
-  checks: CheckSet;
+  scope: TaskScope;
+  commands: CommandTable;
+  artifacts: ArtifactStore;
 }
 
 /** `summary` is persisted in the trace; `observation` goes back to the model and is untrusted data. */
@@ -110,6 +134,8 @@ export interface ToolOutput {
   ok: boolean;
   summary: string;
   observation: string;
+  exitStatus?: number;
+  artifactRef?: string;
 }
 
 export interface ToolAdapter {
@@ -121,7 +147,7 @@ export interface ToolAdapter {
 
 export interface Evaluator {
   readonly version: string;
-  evaluate(input: { evaluationId: string; runId: string; task: Task; workspace: WorkspaceReader; completedAt: Date }): EvaluationResult;
+  evaluate(input: { evaluationId: string; runId: string; task: Task; workspace: Workspace; completedAt: Date }): EvaluationResult;
 }
 
 // ------------------------------------------------------------ trace and run
