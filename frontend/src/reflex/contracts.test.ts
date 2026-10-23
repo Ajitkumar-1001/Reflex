@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   EventSchema,
+  JudgeVerdictSchema,
+  LifecycleState,
+  MEMORY_TRANSITIONS,
   MemoryCandidateSchema,
+  MemoryKind,
+  MemoryRecordSchema,
+  ReflectionSchema,
   RunSchema,
   RunState,
   TERMINAL_RESULTS,
@@ -11,6 +17,7 @@ import {
   ToolCallRequest,
   assertTransition,
   canTransition,
+  canTransitionMemory,
   isLegalTerminalResult,
   isTerminal,
 } from "./contracts";
@@ -167,5 +174,93 @@ describe("memory candidate contract (INV-01, INV-03)", () => {
 
   it("rejects out-of-range confidence", () => {
     expect(MemoryCandidateSchema.safeParse({ ...candidate, confidence: 1.5 }).success).toBe(false);
+  });
+});
+
+describe("memory contracts (PRD §9.5, §9.6, §10)", () => {
+  const record = {
+    id: "m1",
+    tenantId: "tn",
+    projectId: "p",
+    kind: "playbook_item",
+    text: "Run pnpm gen:client after editing schema.prisma",
+    tags: [],
+    scope: { conditions: ["schema.prisma changed"] },
+    preconditions: [],
+    lifecycleState: "candidate",
+    confidence: 0.5,
+    sourceRunIds: ["r1"],
+    evaluationIds: ["ev1"],
+    version: 1,
+    supersedes: null,
+    lastVerifiedAt: null,
+    expiresAt: null,
+    embeddingModel: null,
+    embeddingVersion: null,
+    indexVersion: null,
+    helpfulCount: 0,
+    harmfulCount: 0,
+    gateDecision: null,
+    derivedFromMemoryIds: [],
+    contentHash: "sha256:abc",
+  };
+
+  it("has the v1.4 kinds and the single lifecycle_state field with its eight values", () => {
+    expect(MemoryKind.options).toEqual(["episodic", "semantic", "procedural", "playbook_item"]);
+    expect(LifecycleState.options).toEqual([
+      "candidate", "approved", "rejected", "demoted", "quarantined", "superseded", "expired", "retired",
+    ]);
+    expect(MemoryRecordSchema.safeParse(record).success).toBe(true);
+    expect(MemoryRecordSchema.safeParse({ ...record, status: "approved" }).success).toBe(false);
+    expect(MemoryRecordSchema.safeParse({ ...record, lifecycleState: "pending" }).success).toBe(false);
+  });
+
+  it("follows the §9.6 lifecycle transitions", () => {
+    expect(canTransitionMemory("candidate", "approved")).toBe(true);
+    expect(canTransitionMemory("candidate", "quarantined")).toBe(false);
+    for (const to of ["demoted", "quarantined", "superseded", "expired", "retired"] as const) {
+      expect(canTransitionMemory("approved", to)).toBe(true);
+    }
+    for (const from of ["demoted", "expired", "quarantined"] as const) expect(MEMORY_TRANSITIONS[from]).toEqual(["approved"]);
+    expect(MEMORY_TRANSITIONS.rejected).toEqual([]);
+    expect(MEMORY_TRANSITIONS.retired).toEqual([]);
+  });
+
+  it("accepts a playbook_item candidate only with an evaluation", () => {
+    const candidate = {
+      kind: "playbook_item",
+      lesson: "run the generator first",
+      applicability: { projectId: "p", conditions: ["schema changed"] },
+      evidenceStatus: "observed",
+      sourceRunIds: ["r1"],
+      evaluationIds: ["ev1"],
+      evidenceRefs: ["event:r1:3"],
+      limitations: [],
+      confidence: 0.4,
+    };
+    expect(MemoryCandidateSchema.safeParse(candidate).success).toBe(true);
+    expect(MemoryCandidateSchema.safeParse({ ...candidate, evaluationIds: [] }).success).toBe(false);
+  });
+
+  it("validates the reflection and judge contracts and the memory event variants", () => {
+    const reflection = {
+      outcome: "verified_failure",
+      failureMode: "stale_tool_version_assumption",
+      evidenceRefs: ["event:run-123:17", "evaluation:eval-123"],
+      lesson: "Verify the installed CLI flag before using it in this repository",
+      appliesWhen: ["same CLI family"],
+      doesNotApplyWhen: ["version already pinned and verified"],
+      suggestedMemoryKind: "procedural",
+      requiresReview: false,
+    };
+    expect(ReflectionSchema.safeParse(reflection).success).toBe(true);
+    expect(ReflectionSchema.safeParse({ ...reflection, reasoning: "private" }).success).toBe(false);
+    const judge = { supported: true, unsupportedClaims: [], generic: false, instructionLike: false, rationaleSummary: "ok" };
+    expect(JudgeVerdictSchema.safeParse(judge).success).toBe(true);
+
+    const base = { id: "e1", runId: "r1", sequence: 1, actor: { kind: "system", id: "x" }, timestamp: ts };
+    const use = { memoryId: "m1", citedInPlan: true, followed: true, outcomeEffect: "helped" };
+    expect(EventSchema.safeParse({ ...base, type: "memory_use", redactedPayload: use }).success).toBe(true);
+    expect(EventSchema.safeParse({ ...base, type: "memory_use", redactedPayload: { ...use, outcomeEffect: "great" } }).success).toBe(false);
   });
 });

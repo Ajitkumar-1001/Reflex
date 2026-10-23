@@ -1,9 +1,7 @@
 import { z } from "zod";
 
 /*
- * Canonical Reflex contracts (PRD v1.0 §7.1, §7.2, §10, §11, §12, §13).
- * Source of truth is PRD v1.0. One precision is borrowed from v1.4: the `failed`
- * run outcome, because v1.0 has a FAILED state but no outcome to pair it with.
+ * Canonical Reflex contracts. Source of truth: PRD v1.4 (§7.1, §7.2, §9, §10, §11, §12, §13, §15.2).
  */
 
 // ---------------------------------------------------------------- primitives
@@ -263,6 +261,79 @@ export const RunSchema = z
   });
 export type Run = z.infer<typeof RunSchema>;
 
+// ---------------------------------------------------------------------- memory
+
+export const MemoryKind = z.enum(["episodic", "semantic", "procedural", "playbook_item"]);
+export type MemoryKind = z.infer<typeof MemoryKind>;
+
+/** The only memory state field (PRD §9.6, §10); only `approved` is retrievable. */
+export const LifecycleState = z.enum([
+  "candidate",
+  "approved",
+  "rejected",
+  "demoted",
+  "quarantined",
+  "superseded",
+  "expired",
+  "retired",
+]);
+export type LifecycleState = z.infer<typeof LifecycleState>;
+
+/**
+ * Allowed lifecycle transitions (PRD §9.6). Guards that need an actor or evidence are not
+ * encoded here: demoted|expired -> approved needs re-verification evidence, and
+ * quarantined -> approved is `owner` only. `rejected` and `retired` are terminal.
+ */
+export const MEMORY_TRANSITIONS: Record<LifecycleState, readonly LifecycleState[]> = {
+  candidate: ["approved", "rejected"],
+  approved: ["demoted", "quarantined", "superseded", "expired", "retired"],
+  demoted: ["approved"],
+  expired: ["approved"],
+  quarantined: ["approved"],
+  superseded: [],
+  rejected: [],
+  retired: [],
+};
+
+export function canTransitionMemory(from: LifecycleState, to: LifecycleState): boolean {
+  return MEMORY_TRANSITIONS[from].includes(to);
+}
+
+export const GateResult = z.enum(["APPROVE", "REJECT", "REVIEW_REQUIRED"]);
+export type GateResult = z.infer<typeof GateResult>;
+
+export const GateDecisionSchema = z.strictObject({
+  result: GateResult,
+  reasonCodes: z.array(NonEmpty),
+  judgeModel: z.string().nullable(),
+  reviewer: z.string().nullable(),
+  decidedAt: Timestamp,
+});
+export type GateDecision = z.infer<typeof GateDecisionSchema>;
+
+/** Gate judge output (PRD §9.3 judge contract). */
+export const JudgeVerdictSchema = z.strictObject({
+  supported: z.boolean(),
+  unsupportedClaims: z.array(z.string()),
+  generic: z.boolean(),
+  instructionLike: z.boolean(),
+  rationaleSummary: z.string(),
+});
+export type JudgeVerdict = z.infer<typeof JudgeVerdictSchema>;
+
+/** Reflector output (PRD §12): an evidence summary, never a chain-of-thought transcript (INV-04). */
+export const ReflectionSchema = z.strictObject({
+  outcome: RunOutcome,
+  failureMode: NonEmpty,
+  evidenceRefs: z.array(NonEmpty),
+  lesson: NonEmpty,
+  appliesWhen: z.array(NonEmpty),
+  doesNotApplyWhen: z.array(NonEmpty),
+  suggestedMemoryKind: MemoryKind,
+  requiresReview: z.boolean(),
+});
+export type Reflection = z.infer<typeof ReflectionSchema>;
+
 // ---------------------------------------------------------------------- events
 
 const Actor = z.strictObject({ kind: z.enum(["system", "model", "tool", "evaluator", "user"]), id: NonEmpty });
@@ -300,6 +371,17 @@ export const EventSchema = z.discriminatedUnion("type", [
   ),
   eventVariant("evaluation_recorded", z.strictObject({ evaluationId: Id, verdict: RunOutcome })),
   eventVariant("reflection_skipped", z.strictObject({ reason: z.literal("memory_disabled") })),
+  eventVariant(
+    "memory_use",
+    z.strictObject({
+      memoryId: Id,
+      citedInPlan: z.boolean(),
+      followed: z.boolean(),
+      outcomeEffect: z.enum(["helped", "hurt", "neutral", "unknown"]),
+      evidenceRef: z.string().optional(),
+    }),
+  ),
+  eventVariant("gate_decision", z.strictObject({ memoryId: Id, decision: GateDecisionSchema })),
 ]);
 export type RunEvent = z.infer<typeof EventSchema>;
 export type RunEventType = RunEvent["type"];
@@ -325,11 +407,6 @@ export const EvaluationSchema = z.strictObject({
 });
 export type EvaluationResult = z.infer<typeof EvaluationSchema>;
 
-// ---------------------------------------------------------------------- memory
-
-export const MemoryKind = z.enum(["episodic", "semantic", "procedural"]);
-export type MemoryKind = z.infer<typeof MemoryKind>;
-
 export const MemoryCandidateSchema = z
   .strictObject({
     kind: MemoryKind,
@@ -350,18 +427,15 @@ export const MemoryCandidateSchema = z
     const fail = (path: string, message: string) => ctx.addIssue({ code: "custom", path: [path], message });
     if (m.sourceRunIds.length === 0) fail("sourceRunIds", "a memory needs provenance (INV-01)");
     if (m.kind !== "episodic" && m.evaluationIds.length === 0) {
-      fail("evaluationIds", "semantic and procedural memory need a recorded evaluation (INV-01)");
+      fail("evaluationIds", "only episodic records may lack a recorded evaluation (INV-01)");
     }
-    if (m.kind === "procedural" && m.evidenceStatus !== "observed") {
+    if (m.kind === "procedural" && (m.evidenceStatus === "hypothesis" || m.evidenceStatus === "rejected")) {
       fail("evidenceStatus", "an untested hypothesis is not a reusable procedure (INV-03)");
     }
   });
 export type MemoryCandidate = z.infer<typeof MemoryCandidateSchema>;
 
-export const MemoryStatus = z.enum(["candidate", "approved", "rejected", "expired", "retired"]);
-export type MemoryStatus = z.infer<typeof MemoryStatus>;
-
-/** The `memories` collection record (PRD v1.0 §10). Nothing writes it in Phase 0. */
+/** The `memories` collection record (PRD §10, v1.1 additions, §15.2 `Memory`). Nothing writes it in Phase 0. */
 export const MemoryRecordSchema = z.strictObject({
   id: Id,
   tenantId: Id,
@@ -370,9 +444,14 @@ export const MemoryRecordSchema = z.strictObject({
   text: NonEmpty,
   embedding: z.array(z.number()).optional(),
   tags: z.array(z.string()),
-  scope: z.array(NonEmpty),
+  scope: z.strictObject({
+    stack: z.array(NonEmpty).optional(),
+    environment: z.string().optional(),
+    toolVersions: z.record(z.string(), z.string()).optional(),
+    conditions: z.array(NonEmpty),
+  }),
   preconditions: z.array(z.string()),
-  status: MemoryStatus,
+  lifecycleState: LifecycleState,
   confidence: z.number().min(0).max(1),
   sourceRunIds: z.array(Id).min(1),
   evaluationIds: z.array(Id),
@@ -380,5 +459,13 @@ export const MemoryRecordSchema = z.strictObject({
   supersedes: Id.nullable(),
   lastVerifiedAt: Timestamp.nullable(),
   expiresAt: Timestamp.nullable(),
+  embeddingModel: z.string().nullable(),
+  embeddingVersion: z.string().nullable(),
+  indexVersion: z.string().nullable(),
+  helpfulCount: z.int().nonnegative(),
+  harmfulCount: z.int().nonnegative(),
+  gateDecision: GateDecisionSchema.nullable(),
+  derivedFromMemoryIds: z.array(Id),
+  contentHash: NonEmpty,
 });
 export type MemoryRecord = z.infer<typeof MemoryRecordSchema>;
