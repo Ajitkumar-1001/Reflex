@@ -10,6 +10,7 @@ import {
   FIXTURE_TASK,
   SOLUTION_STEPS,
   fixtureModel,
+  investigationTask,
   runFixture,
 } from "./fixture";
 import { ToolRegistry } from "./permission";
@@ -68,7 +69,7 @@ describe("Phase 0 exit gate: deterministic fixture", () => {
     const { run: r } = await run();
     expect(r.modelConfig).toEqual({ provider: "stub", model: "scripted", version: "1" });
     expect(r.toolRegistryVersion).toBe("p0-stub-tools-1");
-    expect(r.policy).toEqual({ id: FIXTURE_POLICY.id, version: FIXTURE_POLICY.version });
+    expect([r.policyId, r.policyVersion]).toEqual([FIXTURE_POLICY.id, FIXTURE_POLICY.version]);
     expect(r.startWorkspaceHash).not.toBe(r.endWorkspaceHash);
   });
 
@@ -101,7 +102,7 @@ describe("evaluation honesty (INV-01, INV-09)", () => {
   });
 
   it("is inconclusive when a done-when check cannot be resolved", async () => {
-    const task = { ...FIXTURE_TASK, doneWhen: [{ checkId: "ghost_check", description: "unknown" }] };
+    const task = { ...FIXTURE_TASK, doneWhen: { checks: [{ name: "ghost_check", command: "ghost" }] } };
     const { run: r, evaluation } = await run({ task });
     expect([r.status, r.outcome, r.outcomeReason]).toEqual(["INCONCLUSIVE", "inconclusive", "missing_checks"]);
     expect(evaluation?.checks[0].passed).toBeNull();
@@ -137,7 +138,7 @@ describe("tool permission enforcement (FR-06)", () => {
     const denials = events.flatMap((e) => (e.type === "policy_denied" ? [e.redactedPayload] : []));
     expect(denials.map((d) => [d.tool, d.reasonCode])).toEqual([
       ["git_push", "unregistered_tool"],
-      ["post_comment", "tool_not_authorized_for_task"],
+      ["post_comment", "tool_not_in_policy"],
     ]);
 
     const audit = auditTrace(events);
@@ -187,28 +188,34 @@ describe("tool permission enforcement (FR-06)", () => {
 describe("admission (FR-01)", () => {
   it("rejects a build task with no definition of done and creates no run", async () => {
     const sink = vi.fn();
-    const result = await runFixture({ task: { ...FIXTURE_TASK, doneWhen: [] }, sink: { append: sink } });
+    const result = await runFixture({ task: { ...FIXTURE_TASK, doneWhen: { checks: [] } }, sink: { append: sink } });
     expect(result.admitted).toBe(false);
-    if (!result.admitted) expect(result.issues[0].code).toBe("invalid_task");
+    if (!result.admitted) expect(result.issues[0]).toMatchObject({ code: "validation_error", reason: "invalid_task" });
     expect(sink).not.toHaveBeenCalled();
   });
 
-  it("rejects tasks that authorize unregistered tools, tools outside the policy, or mismatched policy pins", async () => {
-    const unregistered = await runFixture({ task: { ...FIXTURE_TASK, authorizedTools: [...FIXTURE_TASK.authorizedTools, "rm_rf"] } });
-    const outsidePolicy = await runFixture({ policy: { ...FIXTURE_POLICY, toolAllowlist: ["read_file", "finish"] } });
-    const mismatch = await runFixture({ task: { ...FIXTURE_TASK, policy: { id: FIXTURE_POLICY.id, version: 2 } } });
-    const codes = (r: RunResult) => (r.admitted ? [] : r.issues.map((i) => i.code));
-    expect(codes(unregistered)).toContain("unregistered_tool");
-    expect(codes(outsidePolicy)).toContain("tool_not_in_policy");
-    expect(codes(mismatch)).toContain("policy_mismatch");
+  it("rejects a policy that allows an unregistered tool, or a mismatched policy pin", async () => {
+    const unregistered = await runFixture({ policy: { ...FIXTURE_POLICY, toolAllowlist: [...FIXTURE_POLICY.toolAllowlist, "rm_rf"] } });
+    const mismatch = await runFixture({ task: { ...FIXTURE_TASK, policyVersion: 2 } });
+    const reasons = (r: RunResult) => (r.admitted ? [] : r.issues.map((i) => i.reason));
+    expect(reasons(unregistered)).toContain("unregistered_tool");
+    expect(reasons(mismatch)).toContain("policy_mismatch");
   });
 
-  it("rejects an investigation task that authorizes a write tool and a policy that is not ACTIVE", async () => {
-    const investigate = await runFixture({ task: { ...FIXTURE_TASK, mode: "investigate", doneWhen: [] } });
-    const draft = await runFixture({ policy: { ...FIXTURE_POLICY, status: "DRAFT" } });
-    expect(investigate.admitted).toBe(false);
-    if (!investigate.admitted) expect(investigate.issues.map((i) => i.code)).toContain("write_in_investigation_mode");
-    expect(draft.admitted).toBe(false);
+  it("blocks a plan that needs a tool the policy does not allow", async () => {
+    const policy = { ...FIXTURE_POLICY, toolAllowlist: ["read_file", "finish"] };
+    const { run: r, events } = await run({ policy });
+    expect([r.status, r.outcomeReason]).toEqual(["BLOCKED", "policy_denied"]);
+    const denial = events.find((e) => e.type === "policy_denied");
+    expect(denial?.type === "policy_denied" && denial.redactedPayload.reasonCode).toBe("tool_not_in_policy");
+  });
+
+  it("admits an investigation task but blocks a plan that writes, and does not admit a policy that is not ACTIVE", async () => {
+    const { run: r, events } = await run({ task: investigationTask() });
+    expect([r.status, r.outcomeReason]).toEqual(["BLOCKED", "policy_denied"]);
+    const denial = events.find((e) => e.type === "policy_denied");
+    expect(denial?.type === "policy_denied" && denial.redactedPayload.reasonCode).toBe("write_in_investigation_mode");
+    expect((await runFixture({ policy: { ...FIXTURE_POLICY, status: "DRAFT" } })).admitted).toBe(false);
   });
 
   it("blocks a run whose policy enables memory, because this runner is memory-disabled", async () => {
@@ -235,7 +242,7 @@ describe("failure states are explicit and legal", () => {
   });
 
   it("fails with budget_exhausted when the wall-clock budget runs out", async () => {
-    const task = { ...FIXTURE_TASK, budget: { ...FIXTURE_TASK.budget, maxWallMs: 50 } };
+    const task = { ...FIXTURE_TASK, budget: { ...FIXTURE_TASK.budget, maxWallMinutes: 50 / 60_000 } };
     const { run: r } = await run({ task });
     expect([r.outcome, r.outcomeReason]).toEqual(["failed", "budget_exhausted"]);
   });

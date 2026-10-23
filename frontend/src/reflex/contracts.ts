@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { normalizePath } from "./paths";
 
 /*
  * Canonical Reflex contracts. Source of truth: PRD v1.4 (§7.1, §7.2, §9, §10, §11, §12, §13, §15.2).
@@ -32,14 +33,19 @@ export type RiskClass = z.infer<typeof RiskClass>;
 export const SideEffectClass = z.enum(["read_only", "workspace_write", "external_write"]);
 export type SideEffectClass = z.infer<typeof SideEffectClass>;
 
+export const EvalSplit = z.enum(["train", "test", "none"]);
+export type EvalSplit = z.infer<typeof EvalSplit>;
+
+export const TaskSource = z.enum(["fixture", "live", "cody"]);
+export type TaskSource = z.infer<typeof TaskSource>;
+
+/** PRD §15.2. Wall-clock is in minutes, the unit of the §7.8 policy defaults. */
 export const Budget = z.strictObject({
   maxSteps: z.int().positive(),
-  maxWallMs: z.int().positive(),
   maxUsd: z.number().nonnegative(),
+  maxWallMinutes: z.number().positive(),
 });
 export type Budget = z.infer<typeof Budget>;
-
-const PolicyRef = z.strictObject({ id: Id, version: z.int().positive() });
 
 // --------------------------------------------------------------- state machine
 
@@ -67,16 +73,17 @@ export function isTerminal(state: RunState): state is TerminalState {
 }
 
 /**
- * Allowed transitions. Main path per v1.0 §7.1; every non-terminal state may also
- * move to CANCELLED or FAILED. BLOCKED is reachable wherever a policy decision can
- * stop a run (admission, planning, execution); INCONCLUSIVE from every phase where
- * the model or infrastructure can fail (v1.0 §7.1 lists it only after EVALUATING).
- * WAITING_APPROVAL and RETRY_PENDING are P1 and intentionally absent.
+ * Allowed transitions. Main path and explicit rules of PRD v1.4 §7.1: every non-terminal state may
+ * move to CANCELLED or FAILED, ADMITTED -> BLOCKED, EVALUATING -> INCONCLUSIVE, REFLECTING -> COMPLETE.
+ * BLOCKED and INCONCLUSIVE are also reachable from PLANNING and EXECUTING, because §7.8 (3 policy
+ * denials -> BLOCKED/policy_denied; provider or sandbox failure -> INCONCLUSIVE) and §11 (a plan that
+ * needs an external write -> BLOCKED/approval_required_p0) require it and §7.1's literal list does not
+ * cover them. WAITING_APPROVAL and RETRY_PENDING are P1 and intentionally absent.
  */
 export const TRANSITIONS: Record<RunState, readonly RunState[]> = {
   CREATED: ["ADMITTED", "CANCELLED", "FAILED"],
   ADMITTED: ["RETRIEVING", "BLOCKED", "CANCELLED", "FAILED"],
-  RETRIEVING: ["PLANNING", "INCONCLUSIVE", "CANCELLED", "FAILED"],
+  RETRIEVING: ["PLANNING", "CANCELLED", "FAILED"],
   PLANNING: ["EXECUTING", "BLOCKED", "INCONCLUSIVE", "CANCELLED", "FAILED"],
   EXECUTING: ["EVALUATING", "BLOCKED", "INCONCLUSIVE", "CANCELLED", "FAILED"],
   EVALUATING: ["REFLECTING", "INCONCLUSIVE", "CANCELLED", "FAILED"],
@@ -143,31 +150,64 @@ export function isLegalTerminalResult(state: RunState, outcome: RunOutcome, reas
 
 // ----------------------------------------------------------------------- task
 
-export const TaskSchema = z
-  .strictObject({
-    id: Id,
-    tenantId: Id,
-    projectId: Id,
-    objective: NonEmpty,
-    mode: TaskMode,
-    scope: z.strictObject({
-      workspaceRef: NonEmpty,
-      allowedPaths: z.array(NonEmpty).min(1),
-      protectedPaths: z.array(NonEmpty),
-    }),
-    doneWhen: z.array(z.strictObject({ checkId: NonEmpty, description: NonEmpty })),
-    authorizedTools: z.array(NonEmpty),
-    riskClass: RiskClass,
-    budget: Budget,
-    policy: PolicyRef,
-    requestedBy: NonEmpty,
-    createdAt: Timestamp,
-  })
-  .refine((t) => t.mode !== "build" || t.doneWhen.length > 0, {
-    path: ["doneWhen"],
-    message: "build-mode tasks need an observable definition of done",
-  });
+const WorkspacePath = NonEmpty.refine((p) => normalizePath(p) !== null, {
+  message: "must be a workspace-relative path without '..' segments",
+});
+
+/** PRD §15.2. Without `paths` the whole task worktree is in scope; with it, the agent is confined to them. */
+export const TaskScope = z.strictObject({
+  repo: NonEmpty,
+  commit: NonEmpty,
+  paths: z.array(WorkspacePath).min(1).optional(),
+  protectedPaths: z.array(WorkspacePath).optional(),
+});
+export type TaskScope = z.infer<typeof TaskScope>;
+
+const CheckDefinition = z.strictObject({ name: NonEmpty, command: NonEmpty });
+
+const taskFields = {
+  projectId: Id,
+  objective: NonEmpty,
+  scope: TaskScope,
+  riskClass: RiskClass,
+  budget: Budget,
+  policyId: Id,
+  policyVersion: z.int().positive(),
+  taskClass: NonEmpty.optional(),
+};
+const buildFields = {
+  mode: z.literal("build"),
+  doneWhen: z.strictObject({ checks: z.array(CheckDefinition).min(1), hiddenCheckBundleRef: NonEmpty.optional() }),
+};
+const investigateFields = { mode: z.literal("investigate") }; // no `doneWhen`: strict rejects it, as `doneWhen?: never` does
+
+/** The `POST /v1/tasks` body (PRD §15.2). Identity fields are server-derived and absent here. */
+export const CreateTaskSchema = z.discriminatedUnion("mode", [
+  z.strictObject({ ...taskFields, ...buildFields }),
+  z.strictObject({ ...taskFields, ...investigateFields }),
+]);
+export type CreateTask = z.infer<typeof CreateTaskSchema>;
+
+const serverTaskFields = {
+  id: Id,
+  tenantId: Id,
+  requestedBy: NonEmpty,
+  createdAt: Timestamp,
+  source: TaskSource,
+  split: EvalSplit.optional(),
+};
+
+/** The stored `tasks` document (PRD §10 and its v1.1 additions): a CreateTask plus server-derived fields. */
+export const TaskSchema = z.discriminatedUnion("mode", [
+  z.strictObject({ ...taskFields, ...buildFields, ...serverTaskFields }),
+  z.strictObject({ ...taskFields, ...investigateFields, ...serverTaskFields }),
+]);
 export type Task = z.infer<typeof TaskSchema>;
+
+/** Checks the task is graded by; empty for investigation tasks. */
+export function taskChecks(task: Task): readonly { name: string; command: string }[] {
+  return task.mode === "build" ? task.doneWhen.checks : [];
+}
 
 // ----------------------------------------------------------------------- plan
 
@@ -194,11 +234,11 @@ export type ToolCallRequest = z.infer<typeof ToolCallRequest>;
 
 export const DenialReason = z.enum([
   "unregistered_tool",
-  "tool_not_authorized_for_task",
   "tool_not_in_policy",
   "external_write_not_permitted",
   "write_in_investigation_mode",
   "invalid_arguments",
+  "command_not_allowed",
   "path_outside_scope",
   "protected_path",
 ]);
@@ -213,6 +253,8 @@ export const PolicySchema = z.strictObject({
   status: z.enum(["DRAFT", "TESTED", "APPROVED", "CANARY", "ACTIVE", "RETIRED", "ROLLED_BACK"]),
   riskClass: RiskClass,
   toolAllowlist: z.array(NonEmpty),
+  /** argv prefixes `run_command` may execute, e.g. ["npx","tsc"] (PRD §11 assigns the allowlist to the policy). */
+  commandAllowlist: z.array(z.array(NonEmpty).min(1)),
   routingPreferences: z.record(z.string(), z.string()),
   memoryRules: z.strictObject({ retrievalEnabled: z.boolean(), writebackEnabled: z.boolean() }),
   budgets: Budget,
@@ -230,7 +272,8 @@ export const RunSchema = z
     id: Id,
     taskId: Id,
     status: RunState,
-    policy: PolicyRef,
+    policyId: Id,
+    policyVersion: z.int().positive(),
     modelConfig: z.strictObject({ provider: NonEmpty, model: NonEmpty, version: NonEmpty }),
     promptTemplateVersion: NonEmpty,
     toolRegistryVersion: NonEmpty,

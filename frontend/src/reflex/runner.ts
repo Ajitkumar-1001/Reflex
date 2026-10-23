@@ -2,9 +2,7 @@ import {
   EvaluationSchema,
   EventSchema,
   PlanSchema,
-  PolicySchema,
   RunSchema,
-  TaskSchema,
   ToolCallRequest,
   assertTransition,
   isTerminal,
@@ -23,11 +21,11 @@ import type {
   Task,
   TerminalState,
 } from "./contracts";
+import { admitTask } from "./admission";
 import { authorizeToolCall, checkToolAccess } from "./permission";
 import type { ToolRegistry } from "./permission";
 import { ModelUnavailableError } from "./ports";
 import type {
-  AdmissionIssue,
   CheckSet,
   Clock,
   EventSink,
@@ -53,46 +51,12 @@ import type { z } from "zod";
 const PROMPT_TEMPLATE_VERSION = "p0-scripted-1";
 const MAX_DENIALS = 3;
 const MAX_MODEL_ATTEMPTS = 2;
-const RISK_RANK = { low: 0, medium: 1, high: 2 } as const;
-
-// ----------------------------------------------------------------- admission
-
-export type Admission = { ok: true; task: Task; policy: Policy } | { ok: false; issues: AdmissionIssue[] };
-
-/** FR-01: typed admission. Anything unknown, unregistered or over-privileged is rejected (INV-08). */
-export function admitTask(taskInput: unknown, policyInput: unknown, registry: ToolRegistry): Admission {
-  const issues: AdmissionIssue[] = [];
-  const task = TaskSchema.safeParse(taskInput);
-  const policy = PolicySchema.safeParse(policyInput);
-  if (!task.success) {
-    issues.push(...task.error.issues.map((i) => ({ code: "invalid_task", message: `${i.path.join(".") || "task"}: ${i.message}` })));
-  }
-  if (!policy.success) {
-    issues.push(...policy.error.issues.map((i) => ({ code: "invalid_policy", message: `${i.path.join(".") || "policy"}: ${i.message}` })));
-  }
-  if (!task.success || !policy.success) return { ok: false, issues };
-
-  const t = task.data;
-  const p = policy.data;
-  if (t.policy.id !== p.id || t.policy.version !== p.version) {
-    issues.push({ code: "policy_mismatch", message: `task pins ${t.policy.id}@${t.policy.version}, got ${p.id}@${p.version}` });
-  }
-  if (p.status !== "ACTIVE") issues.push({ code: "policy_not_active", message: `policy status is ${p.status}` });
-  if (RISK_RANK[t.riskClass] > RISK_RANK[p.riskClass]) {
-    issues.push({ code: "risk_exceeds_policy", message: `task risk ${t.riskClass} exceeds policy risk ${p.riskClass}` });
-  }
-  for (const tool of t.authorizedTools) {
-    const access = checkToolAccess(tool, { task: t, policy: p, registry });
-    if ("denial" in access) issues.push({ code: access.denial.reasonCode, message: access.denial.detail });
-  }
-  return issues.length > 0 ? { ok: false, issues } : { ok: true, task: t, policy: p };
-}
 
 function effectiveBudget(task: Task, policy: Policy): Budget {
   return {
     maxSteps: Math.min(task.budget.maxSteps, policy.budgets.maxSteps),
-    maxWallMs: Math.min(task.budget.maxWallMs, policy.budgets.maxWallMs),
     maxUsd: Math.min(task.budget.maxUsd, policy.budgets.maxUsd),
+    maxWallMinutes: Math.min(task.budget.maxWallMinutes, policy.budgets.maxWallMinutes),
   };
 }
 
@@ -146,7 +110,8 @@ export class ReferenceRunner implements RunEngine {
       id: runId,
       taskId: task.id,
       status: "CREATED",
-      policy: task.policy,
+      policyId: task.policyId,
+      policyVersion: task.policyVersion,
       modelConfig: model.config,
       promptTemplateVersion: PROMPT_TEMPLATE_VERSION,
       toolRegistryVersion: registry.version,
@@ -203,7 +168,7 @@ export class ReferenceRunner implements RunEngine {
       if (request.signal?.aborted) throw new Stop("CANCELLED", "cancelled", "user_cancel", "cancellation requested");
       if (run.ledger.steps >= budget.maxSteps) throw new Stop("FAILED", "failed", "step_limit", `step limit ${budget.maxSteps} reached`);
       if (run.ledger.usd > budget.maxUsd) throw new Stop("FAILED", "failed", "budget_exhausted", "cost budget exhausted");
-      if (run.ledger.wallMs > budget.maxWallMs) throw new Stop("FAILED", "failed", "budget_exhausted", "wall-clock budget exhausted");
+      if (run.ledger.wallMs > budget.maxWallMinutes * 60_000) throw new Stop("FAILED", "failed", "budget_exhausted", "wall-clock budget exhausted");
     };
 
     /** Calls the model, validates its output at the boundary, and re-prompts once with the validation error. */
@@ -237,7 +202,7 @@ export class ReferenceRunner implements RunEngine {
 
       moveTo("PLANNING", "planning");
       const plan: Plan = await callModel("plan", PlanSchema, (validationError) =>
-        model.plan({ objective: task.objective, mode: task.mode, authorizedTools: task.authorizedTools, validationError }),
+        model.plan({ objective: task.objective, mode: task.mode, authorizedTools: policy.toolAllowlist, validationError }),
       );
       if (plan.memoryIds.length > 0) {
         throw new Stop("BLOCKED", "blocked", "policy_denied", "plan cites memory but memory is disabled (INV-02)");

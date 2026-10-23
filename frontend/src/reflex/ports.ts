@@ -131,8 +131,10 @@ export interface EventSink {
   append(event: RunEvent): void;
 }
 
+/** `code` follows the PRD §15.1 error taxonomy; `reason` is the specific rule that failed. */
 export interface AdmissionIssue {
-  code: string;
+  code: "validation_error" | "forbidden_field" | "policy_violation";
+  reason: string;
   message: string;
 }
 

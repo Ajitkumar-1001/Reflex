@@ -19,7 +19,7 @@ async function baselineReport() {
       fixture: run.taskId,
       arm: run.configArm,
       memory: run.retrievalSnapshot.mode,
-      policy: run.policy,
+      policy: { id: run.policyId, version: run.policyVersion },
       modelConfig: run.modelConfig,
       toolRegistryVersion: run.toolRegistryVersion,
       status: run.status,

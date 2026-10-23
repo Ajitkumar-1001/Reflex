@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  CreateTaskSchema,
   EventSchema,
   JudgeVerdictSchema,
   LifecycleState,
@@ -22,7 +23,7 @@ import {
   isTerminal,
 } from "./contracts";
 
-const budget = { maxSteps: 5, maxWallMs: 1000, maxUsd: 1 };
+const budget = { maxSteps: 5, maxUsd: 1, maxWallMinutes: 1 };
 const ts = "2026-01-01T00:00:00.000Z";
 
 const task = {
@@ -31,21 +32,23 @@ const task = {
   projectId: "p",
   objective: "fix bug",
   mode: "build",
-  scope: { workspaceRef: "ws", allowedPaths: ["src"], protectedPaths: [] },
-  doneWhen: [{ checkId: "c1", description: "passes" }],
-  authorizedTools: ["read_file"],
+  scope: { repo: "org/repo", commit: "abc123", paths: ["src"], protectedPaths: [] },
+  doneWhen: { checks: [{ name: "c1", command: "pnpm test" }] },
   riskClass: "low",
   budget,
-  policy: { id: "pol", version: 1 },
+  policyId: "pol",
+  policyVersion: 1,
   requestedBy: "tester",
   createdAt: ts,
+  source: "live",
 };
 
 const run = {
   id: "r1",
   taskId: "t1",
   status: "EXECUTING",
-  policy: { id: "pol", version: 1 },
+  policyId: "pol",
+  policyVersion: 1,
   modelConfig: { provider: "stub", model: "scripted", version: "1" },
   promptTemplateVersion: "p0",
   toolRegistryVersion: "v1",
@@ -61,22 +64,42 @@ const run = {
   outcomeReason: null,
 };
 
-describe("task admission contract (FR-01)", () => {
+describe("task contract (FR-01, PRD §15.2)", () => {
+  const { objective, projectId, scope, riskClass, budget, policyId, policyVersion, id, tenantId, requestedBy, createdAt, source } = task;
+  const investigate = { mode: "investigate", objective, projectId, scope, riskClass, budget, policyId, policyVersion, id, tenantId, requestedBy, createdAt, source };
+
   it("accepts a well-formed build task", () => {
     expect(TaskSchema.safeParse(task).success).toBe(true);
   });
 
-  it("rejects a build task with no definition of done", () => {
-    expect(TaskSchema.safeParse({ ...task, doneWhen: [] }).success).toBe(false);
+  it("rejects a build task with no checks or no doneWhen", () => {
+    expect(TaskSchema.safeParse({ ...task, doneWhen: { checks: [] } }).success).toBe(false);
+    expect(TaskSchema.safeParse(investigate).success).toBe(true);
+    expect(TaskSchema.safeParse({ ...investigate, mode: "build" }).success).toBe(false);
   });
 
-  it("allows an investigation task without a definition of done", () => {
-    expect(TaskSchema.safeParse({ ...task, mode: "investigate", doneWhen: [] }).success).toBe(true);
+  it("allows an investigation task only without doneWhen (doneWhen?: never)", () => {
+    expect(TaskSchema.safeParse({ ...task, mode: "investigate" }).success).toBe(false);
   });
 
-  it("rejects empty scope and unknown fields", () => {
-    expect(TaskSchema.safeParse({ ...task, scope: { ...task.scope, allowedPaths: [] } }).success).toBe(false);
+  it("rejects malformed scope paths, unknown fields and an unknown risk class", () => {
+    for (const paths of [[], ["../x"], ["/abs"]]) {
+      expect(TaskSchema.safeParse({ ...task, scope: { ...task.scope, paths } }).success).toBe(false);
+    }
     expect(TaskSchema.safeParse({ ...task, surprise: true }).success).toBe(false);
+    expect(TaskSchema.safeParse({ ...task, riskClass: "critical" }).success).toBe(false);
+  });
+
+  it("treats absent scope.paths as the whole worktree", () => {
+    const scope = { repo: task.scope.repo, commit: task.scope.commit };
+    expect(TaskSchema.safeParse({ ...task, scope }).success).toBe(true);
+  });
+
+  it("keeps identity out of the create body", () => {
+    const { projectId, objective, scope, doneWhen, riskClass, budget, policyId, policyVersion } = task;
+    const body = { mode: "build", projectId, objective, scope, doneWhen, riskClass, budget, policyId, policyVersion };
+    expect(CreateTaskSchema.safeParse(body).success).toBe(true);
+    expect(CreateTaskSchema.safeParse({ ...body, tenantId: "tn" }).success).toBe(false);
   });
 });
 

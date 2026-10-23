@@ -1,4 +1,4 @@
-import { canTransition, isTerminal } from "./contracts";
+import { canTransition, isTerminal, taskChecks } from "./contracts";
 import type { EvaluationResult, RunEvent, RunState } from "./contracts";
 import type { CheckSet, Evaluator } from "./ports";
 
@@ -12,9 +12,9 @@ export class CheckEvaluator implements Evaluator {
   constructor(private readonly checks: CheckSet) {}
 
   evaluate: Evaluator["evaluate"] = ({ evaluationId, runId, task, workspace, completedAt }) => {
-    const results = task.doneWhen.map(({ checkId }) => {
-      const check = this.checks[checkId];
-      return { name: checkId, command: `check:${checkId}`, passed: check ? check(workspace) : null };
+    const results = taskChecks(task).map(({ name, command }) => {
+      const check = this.checks[name];
+      return { name, command, passed: check ? check(workspace) : null };
     });
     const base = {
       id: evaluationId,

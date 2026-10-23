@@ -2,7 +2,8 @@ import { InMemoryWorkspace, ScriptedModel, SequentialIds, SteppingClock, createS
 import type { ModelScript } from "./adapters";
 import { CheckEvaluator } from "./evaluator";
 import { ToolRegistry } from "./permission";
-import type { Plan, Policy, Task } from "./contracts";
+import { createTask } from "./admission";
+import type { CreateTask, Plan, Policy, Task } from "./contracts";
 import type { CheckSet, EventSink, ModelAdapter, RunResult } from "./ports";
 import { ReferenceRunner } from "./runner";
 
@@ -30,33 +31,55 @@ export const FIXTURE_POLICY: Policy = {
   status: "ACTIVE",
   riskClass: "low",
   toolAllowlist: ["list_files", "read_file", "write_file", "run_check", "finish"],
+  commandAllowlist: [],
   routingPreferences: {},
   memoryRules: { retrievalEnabled: false, writebackEnabled: false },
-  budgets: { maxSteps: 20, maxWallMs: 60_000, maxUsd: 1 },
+  budgets: { maxSteps: 40, maxUsd: 1, maxWallMinutes: 30 }, // PRD §7.8 policy defaults
   approvalRequirements: [],
   evaluationSuiteRef: null,
   promotedBy: null,
   promotedAt: null,
 };
 
-export const FIXTURE_TASK: Task = {
-  id: "task-fix-add-bug",
-  tenantId: "tenant-local",
+/** The `POST /v1/tasks` body for the fixture (PRD §15.2). */
+export const FIXTURE_CREATE_TASK: CreateTask = {
   projectId: "project-fixture",
   objective: "Fix add() so that it returns the sum of its arguments",
   mode: "build",
-  scope: { workspaceRef: "fixture:fix-add-bug", allowedPaths: ["src", "tests"], protectedPaths: ["tests"] },
-  doneWhen: [
-    { checkId: "add_returns_sum", description: "add(2, 3) returns 5" },
-    { checkId: "tests_unchanged", description: "tests were not edited" },
-  ],
-  authorizedTools: ["list_files", "read_file", "write_file", "run_check", "finish"],
+  scope: { repo: "fixture/fix-add-bug", commit: "fixture-commit-1" },
+  doneWhen: {
+    checks: [
+      { name: "add_returns_sum", command: "check:add_returns_sum" },
+      { name: "tests_unchanged", command: "check:tests_unchanged" },
+    ],
+  },
   riskClass: "low",
-  budget: { maxSteps: 10, maxWallMs: 30_000, maxUsd: 0.5 },
-  policy: { id: FIXTURE_POLICY.id, version: FIXTURE_POLICY.version },
+  budget: { maxSteps: 10, maxUsd: 0.5, maxWallMinutes: 0.5 },
+  policyId: FIXTURE_POLICY.id,
+  policyVersion: FIXTURE_POLICY.version,
+};
+
+const SERVER_FIELDS = {
+  id: "task-fix-add-bug",
+  tenantId: "tenant-local",
   requestedBy: "fixture",
   createdAt: "2026-01-01T00:00:00.000Z",
-};
+  source: "fixture",
+} as const;
+
+function mustCreate(body: unknown): Task {
+  const created = createTask(body, SERVER_FIELDS);
+  if (!created.ok) throw new Error(`invalid fixture task: ${JSON.stringify(created.issues)}`);
+  return created.task;
+}
+
+export const FIXTURE_TASK: Task = mustCreate(FIXTURE_CREATE_TASK);
+
+/** The same task declared as an investigation: no `doneWhen`, no writes. */
+export function investigationTask(): Task {
+  const { projectId, objective, scope, riskClass, budget, policyId, policyVersion } = FIXTURE_CREATE_TASK;
+  return mustCreate({ projectId, objective, scope, riskClass, budget, policyId, policyVersion, mode: "investigate" });
+}
 
 export const FIXTURE_PLAN: Plan = {
   goal: "Make add() return a + b",
@@ -82,7 +105,7 @@ export const SOLUTION_STEPS: readonly unknown[] = [
 ];
 
 export function fixtureWorkspace(): InMemoryWorkspace {
-  return new InMemoryWorkspace(FIXTURE_TASK.scope.workspaceRef, FIXTURE_FILES);
+  return new InMemoryWorkspace(`${FIXTURE_TASK.scope.repo}@${FIXTURE_TASK.scope.commit}`, FIXTURE_FILES);
 }
 
 export function fixtureRegistry(): ToolRegistry {

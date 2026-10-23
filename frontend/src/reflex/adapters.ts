@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { SideEffectClass } from "./contracts";
-import { normalizePath } from "./permission";
+import { normalizePath } from "./paths";
 import type {
   Clock,
   IdGenerator,
