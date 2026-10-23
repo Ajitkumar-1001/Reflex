@@ -296,7 +296,19 @@ export const RunSchema = z
     startWorkspaceHash: NonEmpty,
     endWorkspaceHash: NonEmpty.nullable(),
     budget: Budget,
-    ledger: z.strictObject({ steps: z.int().nonnegative(), usd: z.number().nonnegative(), wallMs: z.int().nonnegative() }),
+    steps: z.int().nonnegative(),
+    cost: z.strictObject({
+      inputTokens: z.int().nonnegative(),
+      outputTokens: z.int().nonnegative(),
+      usd: z.number().nonnegative(),
+      wallMs: z.int().nonnegative(),
+    }),
+    learningCost: z.strictObject({ reflectionTokens: z.int().nonnegative(), gateTokens: z.int().nonnegative() }),
+    playbookVersion: z.string().nullable(),
+    memoryContext: z.array(
+      z.strictObject({ memoryId: Id, version: z.int().positive(), rank: z.int().positive(), score: z.number(), injected: z.boolean() }),
+    ),
+    evalSplit: EvalSplit,
     timestamps: z.strictObject({ createdAt: Timestamp, updatedAt: Timestamp, endedAt: Timestamp.nullable() }),
     outcome: RunOutcome.nullable(),
     outcomeReason: OutcomeReason.nullable(),
@@ -432,6 +444,10 @@ export const EventSchema = z.discriminatedUnion("type", [
     z.strictObject({ stage: z.enum(["plan", "step"]), attempt: z.int().positive(), issues: z.array(z.string()) }),
   ),
   eventVariant("evaluation_recorded", z.strictObject({ evaluationId: Id, verdict: RunOutcome })),
+  eventVariant(
+    "evaluator_tamper_flag",
+    z.strictObject({ evaluationId: Id, touchedProtectedPaths: z.array(NonEmpty), signals: z.array(NonEmpty) }),
+  ),
   eventVariant("reflection_skipped", z.strictObject({ reason: z.literal("memory_disabled") })),
   eventVariant(
     "memory_use",
@@ -450,11 +466,18 @@ export type RunEventType = RunEvent["type"];
 
 // ------------------------------------------------------------------ evaluation
 
+/** The `evaluations` document (PRD §10; `EvaluationResult` in the canonical contracts). */
 export const EvaluationSchema = z.strictObject({
   id: Id,
   runId: Id,
   verdict: RunOutcome,
   outcomeReason: OutcomeReason,
+  checkBundleHash: NonEmpty,
+  /** null when the task has no hidden check bundle, or when it could not be resolved. */
+  hiddenChecksPassed: z.boolean().nullable(),
+  touchedProtectedPaths: z.array(NonEmpty),
+  groundTruthRef: z.string().nullable(),
+  metrics: z.record(z.string(), z.number()),
   checks: z.array(
     z.strictObject({
       name: NonEmpty,

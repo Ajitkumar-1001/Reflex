@@ -106,6 +106,7 @@ export class ReferenceRunner implements RunEngine {
     const system: Actor = { kind: "system", id: "reference-runner" };
     const modelActor: Actor = { kind: "model", id: model.config.model };
     const createdAt = clock.now();
+    const before = workspace.snapshot();
     let evaluation: EvaluationResult | null = null;
 
     const run: Run = {
@@ -123,7 +124,12 @@ export class ReferenceRunner implements RunEngine {
       startWorkspaceHash: workspace.hash(),
       endWorkspaceHash: null,
       budget,
-      ledger: { steps: 0, usd: 0, wallMs: 0 },
+      steps: 0,
+      cost: { inputTokens: 0, outputTokens: 0, usd: 0, wallMs: 0 },
+      learningCost: { reflectionTokens: 0, gateTokens: 0 },
+      playbookVersion: null,
+      memoryContext: [],
+      evalSplit: task.split ?? "none",
       timestamps: { createdAt: createdAt.toISOString(), updatedAt: createdAt.toISOString(), endedAt: null },
       outcome: null,
       outcomeReason: null,
@@ -166,11 +172,11 @@ export class ReferenceRunner implements RunEngine {
     };
 
     const checkLimits = (): void => {
-      run.ledger.wallMs = Math.max(0, clock.now().getTime() - createdAt.getTime());
+      run.cost.wallMs = Math.max(0, clock.now().getTime() - createdAt.getTime());
       if (request.signal?.aborted) throw new Stop("CANCELLED", "cancelled", "user_cancel", "cancellation requested");
-      if (run.ledger.steps >= budget.maxSteps) throw new Stop("FAILED", "failed", "step_limit", `step limit ${budget.maxSteps} reached`);
-      if (run.ledger.usd > budget.maxUsd) throw new Stop("FAILED", "failed", "budget_exhausted", "cost budget exhausted");
-      if (run.ledger.wallMs > budget.maxWallMinutes * 60_000) throw new Stop("FAILED", "failed", "budget_exhausted", "wall-clock budget exhausted");
+      if (run.steps >= budget.maxSteps) throw new Stop("FAILED", "failed", "step_limit", `step limit ${budget.maxSteps} reached`);
+      if (run.cost.usd > budget.maxUsd) throw new Stop("FAILED", "failed", "budget_exhausted", "cost budget exhausted");
+      if (run.cost.wallMs > budget.maxWallMinutes * 60_000) throw new Stop("FAILED", "failed", "budget_exhausted", "wall-clock budget exhausted");
     };
 
     /** Calls the model, validates its output at the boundary, and re-prompts once with the validation error. */
@@ -183,7 +189,9 @@ export class ReferenceRunner implements RunEngine {
       for (let attempt = 1; attempt <= MAX_MODEL_ATTEMPTS; attempt++) {
         checkLimits();
         const response = await call(validationError);
-        run.ledger.usd += response.usage.usd;
+        run.cost.inputTokens += response.usage.inputTokens;
+        run.cost.outputTokens += response.usage.outputTokens;
+        run.cost.usd += response.usage.usd;
         const parsed = schema.safeParse(response.output);
         if (parsed.success) return parsed.data;
         const issues = parsed.error.issues.map((i) => `${i.path.join(".") || "output"}: ${i.message}`).slice(0, 5);
@@ -225,9 +233,9 @@ export class ReferenceRunner implements RunEngine {
       for (let finished = false; !finished; ) {
         checkLimits();
         const call = await callModel("step", ToolCallRequest, (validationError) =>
-          model.nextStep({ step: run.ledger.steps + 1, plan, observations, validationError }),
+          model.nextStep({ step: run.steps + 1, plan, observations, validationError }),
         );
-        run.ledger.steps++;
+        run.steps++;
         const callId = ids.next("call");
         const decision = authorizeToolCall(call, { task, policy, registry });
 
@@ -273,10 +281,22 @@ export class ReferenceRunner implements RunEngine {
           runId,
           task,
           workspace,
+          before,
           completedAt: clock.now(),
         }),
       );
       emit("evaluation_recorded", { kind: "evaluator", id: evaluator.version }, { evaluationId: evaluation.id, verdict: evaluation.verdict });
+      if (evaluation.outcomeReason === "evaluator_tamper_suspected") {
+        emit(
+          "evaluator_tamper_flag",
+          { kind: "evaluator", id: evaluator.version },
+          {
+            evaluationId: evaluation.id,
+            touchedProtectedPaths: evaluation.touchedProtectedPaths,
+            signals: evaluation.evidenceRefs.filter((ref) => ref.startsWith("tamper:")),
+          },
+        );
+      }
 
       if (evaluation.verdict === "inconclusive") {
         throw new Stop("INCONCLUSIVE", "inconclusive", evaluation.outcomeReason, "evaluation could not decide");

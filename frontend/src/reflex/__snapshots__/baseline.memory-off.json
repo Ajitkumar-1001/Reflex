@@ -26,11 +26,17 @@
       "passed": true
     }
   ],
-  "ledger": {
-    "steps": 4,
+  "steps": 4,
+  "cost": {
+    "inputTokens": 500,
+    "outputTokens": 100,
     "usd": 0.005,
     "wallMs": 280
   },
+  "evalSplit": "none",
+  "checkBundleHash": "sha256:126c54f72e67530d8f3d951b0948d7e878297453a1b2020f97e5b305f6236156",
+  "hiddenChecksPassed": null,
+  "touchedProtectedPaths": [],
   "startWorkspaceHash": "2dedde004597acff6c77d43024435a4a27e06b218e3c2464f23257ce5b0277e5",
   "endWorkspaceHash": "b6337fe2f47bbbd3db3edea44d04a62abfa0ff41c53497c79529418625072ea1",
   "eventCount": 20,

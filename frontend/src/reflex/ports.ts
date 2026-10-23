@@ -31,6 +31,8 @@ export interface Workspace {
   read(path: string): string | undefined;
   write(path: string, content: string): void;
   hash(): string;
+  /** Every file by path, for diffing the start and end states of a run. */
+  snapshot(): Readonly<Record<string, string>>;
   /** An independent copy, so a check can run against the final state without being able to change it. */
   clone(): Workspace;
 }
@@ -145,9 +147,27 @@ export interface ToolAdapter {
 
 // -------------------------------------------------------------- evaluation
 
+/**
+ * Checks the agent never sees (PRD §12.1), resolved by the task's `hiddenCheckBundleRef`. The bundle
+ * lives with the evaluator, not in the worktree, so the agent cannot read or edit it.
+ */
+export interface HiddenCheckBundle {
+  checks: readonly { name: string; command: string }[];
+  commands: CommandTable;
+}
+
 export interface Evaluator {
   readonly version: string;
-  evaluate(input: { evaluationId: string; runId: string; task: Task; workspace: Workspace; completedAt: Date }): EvaluationResult;
+  evaluate(input: {
+    evaluationId: string;
+    runId: string;
+    task: Task;
+    /** The workspace as the run left it; the evaluator only runs checks against copies. */
+    workspace: Workspace;
+    /** The workspace as the run found it, to detect changes to protected paths. */
+    before: Readonly<Record<string, string>>;
+    completedAt: Date;
+  }): EvaluationResult;
 }
 
 // ------------------------------------------------------------ trace and run

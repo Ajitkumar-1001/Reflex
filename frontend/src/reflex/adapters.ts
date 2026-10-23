@@ -73,6 +73,10 @@ export class InMemoryWorkspace implements Workspace {
     this.files.set(key, content);
   }
 
+  snapshot(): Readonly<Record<string, string>> {
+    return Object.fromEntries(this.files);
+  }
+
   clone(): InMemoryWorkspace {
     return new InMemoryWorkspace(this.ref, Object.fromEntries(this.files));
   }

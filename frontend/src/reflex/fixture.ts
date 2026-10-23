@@ -5,7 +5,7 @@ import { ToolRegistry } from "./permission";
 import { createTask } from "./admission";
 import { DEFAULT_COMMAND_ALLOWLIST } from "./contracts";
 import type { CreateTask, Plan, Policy, Task } from "./contracts";
-import type { CommandTable, EventSink, ModelAdapter, RunResult } from "./ports";
+import type { CommandTable, EventSink, HiddenCheckBundle, ModelAdapter, RunResult } from "./ports";
 import { ReferenceRunner } from "./runner";
 
 /*
@@ -32,6 +32,17 @@ export const FIXTURE_COMMANDS: CommandTable = {
       : { exitCode: 1, output: "tests/ changed" },
 };
 
+/** Held by the evaluator, never written into the worktree: it accepts only a real `a + b` body, not a comment. */
+export const FIXTURE_HIDDEN_BUNDLES: Readonly<Record<string, HiddenCheckBundle>> = {
+  "fixture-hidden-add": {
+    checks: [{ name: "add_body_sums", command: "node hidden/add.check.js" }],
+    commands: {
+      "node hidden/add.check.js": (ws) =>
+        /=>\s*a\s*\+\s*b\s*;/.test(ws.read("src/add.ts") ?? "") ? { exitCode: 0, output: "" } : { exitCode: 1, output: "add(2, 3) !== 5" },
+    },
+  },
+};
+
 export const FIXTURE_POLICY: Policy = {
   id: "policy-p0-baseline",
   name: "Phase 0 memory-off baseline",
@@ -50,7 +61,7 @@ export const FIXTURE_POLICY: Policy = {
 };
 
 /** The `POST /v1/tasks` body for the fixture (PRD §15.2). */
-export const FIXTURE_CREATE_TASK: CreateTask = {
+export const FIXTURE_CREATE_TASK: Extract<CreateTask, { mode: "build" }> = {
   projectId: "project-fixture",
   objective: "Fix add() so that it returns the sum of its arguments",
   mode: "build",
@@ -82,6 +93,14 @@ function mustCreate(body: unknown): Task {
 }
 
 export const FIXTURE_TASK: Task = mustCreate(FIXTURE_CREATE_TASK);
+
+/** The fixture task graded additionally by the hidden check bundle. */
+export function hiddenCheckTask(): Task {
+  return mustCreate({
+    ...FIXTURE_CREATE_TASK,
+    doneWhen: { ...FIXTURE_CREATE_TASK.doneWhen, hiddenCheckBundleRef: "fixture-hidden-add" },
+  });
+}
 
 /** The same task declared as an investigation: no `doneWhen`, no writes. */
 export function investigationTask(): Task {
@@ -121,7 +140,7 @@ export function fixtureRegistry(): ToolRegistry {
 }
 
 export function fixtureEvaluator(): CheckEvaluator {
-  return new CheckEvaluator(FIXTURE_COMMANDS);
+  return new CheckEvaluator(FIXTURE_COMMANDS, FIXTURE_HIDDEN_BUNDLES);
 }
 
 /** The scripted model that solves the fixture. Pass different `steps` for failure variants. */
