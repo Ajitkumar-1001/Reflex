@@ -1,0 +1,64 @@
+{
+  "fixture": "task-fix-add-bug",
+  "arm": "A",
+  "memory": "disabled",
+  "policy": {
+    "id": "policy-p0-baseline",
+    "version": 1
+  },
+  "modelConfig": {
+    "provider": "stub",
+    "model": "scripted",
+    "version": "1"
+  },
+  "toolRegistryVersion": "p0-stub-tools-1",
+  "status": "COMPLETE",
+  "outcome": "verified_success",
+  "outcomeReason": "checks_passed",
+  "evaluatorVersion": "check-evaluator-p0",
+  "checks": [
+    {
+      "name": "add_returns_sum",
+      "passed": true
+    },
+    {
+      "name": "tests_unchanged",
+      "passed": true
+    }
+  ],
+  "ledger": {
+    "steps": 4,
+    "usd": 0.005,
+    "wallMs": 280
+  },
+  "startWorkspaceHash": "2dedde004597acff6c77d43024435a4a27e06b218e3c2464f23257ce5b0277e5",
+  "endWorkspaceHash": "b6337fe2f47bbbd3db3edea44d04a62abfa0ff41c53497c79529418625072ea1",
+  "eventCount": 20,
+  "eventTypes": [
+    "state_transition",
+    "state_transition",
+    "state_transition",
+    "retrieval_skipped",
+    "state_transition",
+    "plan_recorded",
+    "state_transition",
+    "tool_authorized",
+    "tool_result",
+    "tool_authorized",
+    "tool_result",
+    "tool_authorized",
+    "tool_result",
+    "tool_authorized",
+    "tool_result",
+    "state_transition",
+    "evaluation_recorded",
+    "state_transition",
+    "reflection_skipped",
+    "state_transition"
+  ],
+  "executedToolCalls": 4,
+  "deniedToolCalls": 0,
+  "unauthorizedToolActions": 0,
+  "traceComplete": true,
+  "traceSha256": "0a0b210a2f19f9dc067b37ee99febeba51a78d42997642cb9ca5701ba0376317"
+}

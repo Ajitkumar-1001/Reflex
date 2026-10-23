@@ -1,0 +1,131 @@
+import { InMemoryWorkspace, ScriptedModel, SequentialIds, SteppingClock, createStubTools } from "./adapters";
+import type { ModelScript } from "./adapters";
+import { CheckEvaluator } from "./evaluator";
+import { ToolRegistry } from "./permission";
+import type { Plan, Policy, Task } from "./contracts";
+import type { CheckSet, EventSink, ModelAdapter, RunResult } from "./ports";
+import { ReferenceRunner } from "./runner";
+
+/*
+ * Phase 0 reference fixture ("fix-add-bug"): a one-file repository whose `add` subtracts.
+ * Everything is a pure value so any run of it is reproducible.
+ */
+
+export const FIXTURE_FILES: Readonly<Record<string, string>> = {
+  "src/add.ts": "export const add = (a: number, b: number): number => a - b;\n",
+  "tests/add.test.ts": "// expects add(2, 3) === 5\n",
+};
+
+export const FIXED_ADD_SOURCE = "export const add = (a: number, b: number): number => a + b;\n";
+
+export const FIXTURE_CHECKS: CheckSet = {
+  add_returns_sum: (ws) => ws.read("src/add.ts")?.includes("a + b") === true,
+  tests_unchanged: (ws) => ws.read("tests/add.test.ts") === FIXTURE_FILES["tests/add.test.ts"],
+};
+
+export const FIXTURE_POLICY: Policy = {
+  id: "policy-p0-baseline",
+  name: "Phase 0 memory-off baseline",
+  version: 1,
+  status: "ACTIVE",
+  riskClass: "low",
+  toolAllowlist: ["list_files", "read_file", "write_file", "run_check", "finish"],
+  routingPreferences: {},
+  memoryRules: { retrievalEnabled: false, writebackEnabled: false },
+  budgets: { maxSteps: 20, maxWallMs: 60_000, maxUsd: 1 },
+  approvalRequirements: [],
+  evaluationSuiteRef: null,
+  promotedBy: null,
+  promotedAt: null,
+};
+
+export const FIXTURE_TASK: Task = {
+  id: "task-fix-add-bug",
+  tenantId: "tenant-local",
+  projectId: "project-fixture",
+  objective: "Fix add() so that it returns the sum of its arguments",
+  mode: "build",
+  scope: { workspaceRef: "fixture:fix-add-bug", allowedPaths: ["src", "tests"], protectedPaths: ["tests"] },
+  doneWhen: [
+    { checkId: "add_returns_sum", description: "add(2, 3) returns 5" },
+    { checkId: "tests_unchanged", description: "tests were not edited" },
+  ],
+  authorizedTools: ["list_files", "read_file", "write_file", "run_check", "finish"],
+  riskClass: "low",
+  budget: { maxSteps: 10, maxWallMs: 30_000, maxUsd: 0.5 },
+  policy: { id: FIXTURE_POLICY.id, version: FIXTURE_POLICY.version },
+  requestedBy: "fixture",
+  createdAt: "2026-01-01T00:00:00.000Z",
+};
+
+export const FIXTURE_PLAN: Plan = {
+  goal: "Make add() return a + b",
+  assumptions: ["src/add.ts is the only file that needs to change"],
+  steps: [
+    { description: "read src/add.ts", tool: "read_file" },
+    { description: "write the corrected implementation", tool: "write_file" },
+    { description: "run the sum check", tool: "run_check" },
+    { description: "finish", tool: "finish" },
+  ],
+  tools: ["read_file", "write_file", "run_check", "finish"],
+  stopConditions: ["finish is called"],
+  memoryIds: [],
+  verificationCommands: ["check:add_returns_sum"],
+  expectedArtifacts: ["src/add.ts"],
+};
+
+export const SOLUTION_STEPS: readonly unknown[] = [
+  { tool: "read_file", args: { path: "src/add.ts" } },
+  { tool: "write_file", args: { path: "src/add.ts", content: FIXED_ADD_SOURCE } },
+  { tool: "run_check", args: { checkId: "add_returns_sum" } },
+  { tool: "finish", args: { summary: "fixed add", claimedOutcome: "done" } },
+];
+
+export function fixtureWorkspace(): InMemoryWorkspace {
+  return new InMemoryWorkspace(FIXTURE_TASK.scope.workspaceRef, FIXTURE_FILES);
+}
+
+export function fixtureRegistry(): ToolRegistry {
+  return new ToolRegistry("p0-stub-tools-1", createStubTools());
+}
+
+export function fixtureEvaluator(): CheckEvaluator {
+  return new CheckEvaluator(FIXTURE_CHECKS);
+}
+
+/** The scripted model that solves the fixture. Pass different `steps` for failure variants. */
+export function fixtureModel(steps: readonly unknown[] = SOLUTION_STEPS, plan: unknown = FIXTURE_PLAN): ScriptedModel {
+  const script: ModelScript = { plan, steps };
+  return new ScriptedModel(script);
+}
+
+export interface FixtureRunOptions {
+  model?: ModelAdapter;
+  task?: unknown;
+  policy?: unknown;
+  registry?: ToolRegistry;
+  signal?: AbortSignal;
+  sink?: EventSink;
+}
+
+/**
+ * Runs the fixture memory-off with a fresh workspace, a stepping clock and sequential ids,
+ * so identical options always produce an identical result.
+ */
+export function runFixture(options: FixtureRunOptions = {}): Promise<RunResult> {
+  const runner = new ReferenceRunner({
+    model: options.model ?? fixtureModel(),
+    registry: options.registry ?? fixtureRegistry(),
+    evaluator: fixtureEvaluator(),
+    workspace: fixtureWorkspace(),
+    checks: FIXTURE_CHECKS,
+    clock: new SteppingClock(Date.UTC(2026, 0, 1), 10),
+    ids: new SequentialIds(),
+    sink: options.sink,
+  });
+  return runner.execute({
+    task: options.task ?? FIXTURE_TASK,
+    policy: options.policy ?? FIXTURE_POLICY,
+    signal: options.signal,
+  });
+}
