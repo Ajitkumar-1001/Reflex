@@ -71,15 +71,16 @@ export function isTerminal(state: RunState): state is TerminalState {
 /**
  * Allowed transitions. Main path per v1.0 §7.1; every non-terminal state may also
  * move to CANCELLED or FAILED. BLOCKED is reachable wherever a policy decision can
- * stop a run (admission, planning, execution); INCONCLUSIVE only from EVALUATING.
+ * stop a run (admission, planning, execution); INCONCLUSIVE from every phase where
+ * the model or infrastructure can fail (v1.0 §7.1 lists it only after EVALUATING).
  * WAITING_APPROVAL and RETRY_PENDING are P1 and intentionally absent.
  */
 export const TRANSITIONS: Record<RunState, readonly RunState[]> = {
   CREATED: ["ADMITTED", "CANCELLED", "FAILED"],
   ADMITTED: ["RETRIEVING", "BLOCKED", "CANCELLED", "FAILED"],
-  RETRIEVING: ["PLANNING", "CANCELLED", "FAILED"],
-  PLANNING: ["EXECUTING", "BLOCKED", "CANCELLED", "FAILED"],
-  EXECUTING: ["EVALUATING", "BLOCKED", "CANCELLED", "FAILED"],
+  RETRIEVING: ["PLANNING", "INCONCLUSIVE", "CANCELLED", "FAILED"],
+  PLANNING: ["EXECUTING", "BLOCKED", "INCONCLUSIVE", "CANCELLED", "FAILED"],
+  EXECUTING: ["EVALUATING", "BLOCKED", "INCONCLUSIVE", "CANCELLED", "FAILED"],
   EVALUATING: ["REFLECTING", "INCONCLUSIVE", "CANCELLED", "FAILED"],
   REFLECTING: ["COMPLETE", "CANCELLED", "FAILED"],
   COMPLETE: [],
