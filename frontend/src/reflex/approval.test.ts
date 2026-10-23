@@ -29,7 +29,7 @@ const subject: ApprovalSubject = {
   scope,
   requestedBy: "ada",
 };
-const as = (role: Role, id = role): Principal => ({ id, role, tenantId: "t", projectIds: ["p"] });
+const as = (role: Role, id: string = role): Principal => ({ id, role, tenantId: "t", projectIds: ["p"] });
 const TTL_MS = 1_000;
 
 function service(clock: ManualClock, onRequest?: (request: { id: string }) => void) {

@@ -15,6 +15,7 @@ embedding service or sandbox: every one of those is behind a port, and the stand
 ```
 pnpm test        # Phase 0: contracts, admission, permission, tools, integrity, failures, exit gate, baseline
                  # Phase 1: store, retrieval, gate, lifecycle, memory runner, experiment, explorer, exit gate
+                 # Phase 2 ledger: side-effect ledger, approval pause/approve/deny/expiry, tool runner
 ```
 
 Phase 1 is described from "Phase 1 (§20)" below; everything above that heading is unchanged Phase 0 text except
@@ -144,8 +145,8 @@ Not implemented, and not stubbed: Atlas client, Redis/BullMQ, S3, OpenTelemetry 
 §17.0 tokens and authentication (FR-29; the role matrix itself exists as `access.ts`), redaction of tool-call
 `argsSummary` and plan text in events (they are truncated but not scrubbed; reflections and stored memories are
 scanned and redacted, see Phase 1), a filesystem artifact store and the §27 environment configuration, the
-one-active-run unique index (`409 run_active`), `reflexVersion` on runs, run `checkpoint`, and P1's
-`WAITING_APPROVAL` / `RETRY_PENDING` states.
+one-active-run unique index (`409 run_active`), `reflexVersion` on runs, run `checkpoint`, and
+`RETRY_PENDING` (the queue workstream). `AWAITING_APPROVAL` is the Phase 2 pause; see the last section.
 
 ---
 
@@ -313,3 +314,44 @@ test fail. One survivor, the retriever's quarantined-source check, gained its ow
 
 `mongodb` (DEC-08), an embedding provider SDK (DEC-10), a model provider SDK for the executor, reflector and
 judge (DEC-10, DEC-12), `@opentelemetry/*` (§17.2). BullMQ and Redis are Phase 2 (DEC-03).
+
+---
+
+# Phase 2 workstream B: side-effect ledger and approval
+
+In-process only. No new dependency. Queue leases, checkpoints, retries and cancellation are a separate
+workstream, as are trace and artifact retention. The memory-off baseline does not construct this runtime, so
+its recorded trace is unchanged.
+
+| File | Purpose |
+|---|---|
+| `ledger.ts` | `SideEffectLedger`. A mutation is inserted as `intended` under `runId:step:intentHash` before it runs, then `committed` or `failed`. A second `intend` of the same key returns the existing row and the tool runner does not execute again, including while the first attempt is still `intended` (at-most-once). |
+| `approval.ts` | `ApprovalStore` / `ApprovalService`. A request records who asked, what would run, and the task scope. It closes once: `approved`, `denied`, or `expired`. Deny and expiry keep the reason and never grant the action. |
+| `tool-runner.ts` | `dispatchEffect`, the only path that performs a side effect once an `EffectRuntime` is wired. Every `external_write`, and any tool named in `policy.approvalRequirements`, is refused unless the store holds a matching unexpired grant. Reads are not ledgered. |
+| `access.ts` | The `approve` action is owner-only, separate from a memory `decide`, so the runner cannot approve its own call. |
+
+`ReferenceRunner` takes an optional `effects` bundle. Without it, a registered external write is still denied
+(`approval_required_p0` / `external_write_not_permitted`) and a tool listed in `approvalRequirements` blocks the
+run instead of running. With it, that call moves the run to `AWAITING_APPROVAL` and resumes to `EXECUTING` only
+after an owner approves. Deny and expiry end `BLOCKED` / `blocked` with `approval_denied` or `approval_expired`.
+Cancelling while paused does not run the mutation. The idempotency key on the `tool_result` is the ledger key.
+
+`AWAITING_APPROVAL` is the state the workstream calls awaiting_approval. The enum stays in the same form as
+`EXECUTING` and the rest. `RETRY_PENDING` is not added here.
+
+## Readings (not decisions)
+
+- `policy.approvalRequirements` is a list of tool names. `external_write` needs approval even when the list is empty.
+- The approver role is `owner`. A runner, viewer, or cody-service principal is rejected and the request stays pending.
+- The grant lasts 24 hours unless the caller passes `ttlMs`. The PRD does not give a number.
+- A tool timeout or a thrown tool settles the ledger `failed` and is not dispatched again.
+- `recoverInterruptedRun` still marks a paused run `FAILED/internal_error`. Resuming it across a process is the queue workstream's checkpoint, not this ledger.
+
+## Deferred
+
+| Not built | Why |
+|---|---|
+| Durable ledger and approval records | In-memory stand-in. Redis/BullMQ is DEC-03, and the queue workstream owns leases. |
+| HTTP approve/deny routes, tokens | §15 and §17.0 are still proposed defaults. The service is callable in process. |
+| Retry of an `intended` row after a crash | At-most-once: a crash between the record and the call is not distinguishable from a call that happened. |
+| Ledger rows inside the trace collections | The transition reason and the approval record hold why. Trace retention is the other workstream. |
