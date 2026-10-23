@@ -118,10 +118,11 @@ gained its integrity fields). The diff of each is in git history.
 - An investigation run has no checks, so its evaluation is `inconclusive/missing_checks`; and `run_command`
   (a `workspace_write` tool) is unavailable to it.
 
-## Non-durable by design
+## Non-durable unless a worker is driving it
 
-`ReferenceRunner` is a single-process in-memory executor. A crash loses the run; `recoverInterruptedRun`
-only marks the leftover record. It is **not** the DEC-01 decision: v1.4's proposed default is a custom typed
+`ReferenceRunner` on its own is a single-process executor. A crash loses the run; `recoverInterruptedRun`
+only marks the leftover record. Pass `deps.execution` (see Phase 2 below) and the same loop checkpoints each
+completed step and can resume it. It is **not** the DEC-01 decision: v1.4's proposed default is a custom typed
 state machine behind `RunEngine`, but that is pending owner confirmation, and a Mastra adapter would
 implement the same interface.
 
@@ -133,7 +134,7 @@ implement the same interface.
 | `Workspace`, `CommandTable`, `InfraFailureError` | `InMemoryWorkspace`, scripted commands; no isolation claimed. Sandbox escape tests (§27) and checks run from a pinned image are not possible yet | DEC-02 (Docker sandbox) |
 | `ModelAdapter` | `ScriptedModel`; `ModelUnavailableError` drives the §7.8 retries | DEC-10 (pinned models, spend); DEC-04 (repo privacy, `cloud_not_permitted`, never produced); DEC-12 (judge model) |
 | `EventSink`, `ArtifactStore` | Optional callback; `InMemoryArtifactStore` keyed by sha256 | DEC-08 (six collections, Atlas `events`); DEC-05 (artifact and trace retention) |
-| Durable queue, leases, resume | None; the runner is called directly | DEC-03 (BullMQ/Redis; Phase 2) |
+| Durable queue, leases, resume | `execution/`: `JobQueue` plus an in-memory adapter, per-step checkpoints, worker leases. No BullMQ or Redis client | DEC-03 (a BullMQ/Redis adapter is still the open choice; the interface is what it would implement) |
 | Memory layer | Phase 1, see "Phase 1 seams" below | DEC-05, DEC-06, DEC-08, DEC-10, DEC-11, DEC-12, DEC-13 |
 | Cody / standalone integration | None. Standalone | DEC-07 |
 
@@ -144,8 +145,9 @@ Not implemented, and not stubbed: Atlas client, Redis/BullMQ, S3, OpenTelemetry 
 §17.0 tokens and authentication (FR-29; the role matrix itself exists as `access.ts`), redaction of tool-call
 `argsSummary` and plan text in events (they are truncated but not scrubbed; reflections and stored memories are
 scanned and redacted, see Phase 1), a filesystem artifact store and the §27 environment configuration, the
-one-active-run unique index (`409 run_active`), `reflexVersion` on runs, run `checkpoint`, and P1's
-`WAITING_APPROVAL` / `RETRY_PENDING` states.
+one-active-run unique index (`409 run_active`), `reflexVersion` on runs, and P1's
+`WAITING_APPROVAL` / `RETRY_PENDING` states. Per-step checkpoints for a run that went through the Phase 2
+worker are described below; `recoverInterruptedRun` is still what a bare `ReferenceRunner` gets.
 
 ---
 
@@ -303,7 +305,7 @@ test fail. One survivor, the retriever's quarantined-source check, gained its ow
 | Playbook deltas, versions, pinning, rollback (FR-21; DoD 11) | DEC-13 |
 | The 150-task suite, the 90-task test set, the §12.3 report | DEC-11, DEC-06, DEC-10 |
 | Arm B′ (online writeback during test), arm C, leave-one-out attribution (§12.3 step 6), order sensitivity (7), contamination dedupe (8), the §12.4 regression gate | The suite (DEC-11). B′ also has no value in `Run.configArm` (`A | B | C`) |
-| HTTP routes, idempotency keys, tokens, rate limits, `409 run_active` | §15 and §17.0 are proposed defaults; Phase 2 durability (DEC-03) for the active-run index |
+| HTTP routes, idempotency keys, tokens, rate limits, `409 run_active` | §15 and §17.0 are proposed defaults. Dispatch idempotency lives on `JobQueue`; the HTTP active-run index does not |
 | Review-queue SLA alert, batch decisions | DEC-05 |
 | Retrieval anomaly alert for trigger-keyed poisoning (§17.1), the other §17.2 alerts, OTel spans | Needs the OTel SDK and DEC-08 |
 | Tombstones for deleted memories, consolidation (FR-20) | Deletion semantics belong with the store (DEC-08); consolidation is P2 |
@@ -312,4 +314,29 @@ test fail. One survivor, the retriever's quarantined-source check, gained its ow
 ## Dependencies a real Phase 1 needs (none added)
 
 `mongodb` (DEC-08), an embedding provider SDK (DEC-10), a model provider SDK for the executor, reflector and
-judge (DEC-10, DEC-12), `@opentelemetry/*` (§17.2). BullMQ and Redis are Phase 2 (DEC-03).
+judge (DEC-10, DEC-12), `@opentelemetry/*` (§17.2). A BullMQ/Redis adapter for `JobQueue` is still Phase 2's
+open DEC-03; the in-memory adapter does not add `bullmq` or `ioredis`.
+
+---
+
+# Phase 2 workstream A: hardened execution
+
+One dispatch is one job. `DurableExecutor` leases it and calls the same `ReferenceRunner`, memory-on or
+memory-off. The in-memory `JobQueue` is the only adapter. DEC-03 (BullMQ/Redis) stays open, so `bullmq` and
+`ioredis` are not dependencies.
+
+| Piece | Behaviour |
+|---|---|
+| `enqueue` | Same idempotency key returns the original job, including when it is leased, acked, or dead. A second dispatch does not start a second run |
+| `lease` | One holder. The critical section does not await, so two overlapping leases cannot both take the job. `leaseCount` increments; the job record is not copied |
+| `heartbeat` | Extends `expiresAt` while the token is still active. A stale token raises `LeaseLostError` |
+| `ack` | Completes the job. A repeat ack with the same token is a no-op |
+| `nack` | Counts a failed attempt, waits out `backoffMs`, and dead-letters at `maxAttempts` (default 3). `exponentialBackoff` doubles from 1s and caps at 30s |
+| Expired lease | Counts as a failed attempt and re-queues the same job immediately. At `maxAttempts` the job is dead-lettered instead of re-leased |
+| Checkpoints | Written after the plan is committed, after each tool step (including a denial), after evaluation, and when the run is terminal. A crash mid-step leaves the previous snapshot; the partial workspace write is discarded |
+| Resume | The next attempt restores the run, the trace, id counters, and the stepping clock, and continues at the next step. A terminal checkpoint is returned and not executed again, so a lost ack does not repeat side effects |
+| Cancel | `cancel(dispatchId)` is read at the next step boundary (also before evaluation and reflection). The run stops `CANCELLED` / `cancelled` / `user_cancel`. The in-flight step is allowed to finish |
+
+Cancellation uses the existing state machine. The status is `CANCELLED`; the outcome is `cancelled`. No new state was added (`WAITING_APPROVAL` and `RETRY_PENDING` stay absent).
+
+A crash during `REFLECTING` resumes at the post-evaluation checkpoint, so reflection runs again. Memory rows already inserted by that attempt are not part of the checkpoint (the memory store is the Phase 1 repository). Artifact blobs are not in the checkpoint either; retention of traces and artifacts is the other Phase 2 workstream. The `409 run_active` index is still not built. `recoverInterruptedRun` is unchanged and still marks a bare, non-leased run `FAILED/internal_error`.
