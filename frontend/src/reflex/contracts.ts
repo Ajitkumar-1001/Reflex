@@ -78,7 +78,7 @@ export function isTerminal(state: RunState): state is TerminalState {
  * BLOCKED and INCONCLUSIVE are also reachable from PLANNING and EXECUTING, because §7.8 (3 policy
  * denials -> BLOCKED/policy_denied; provider or sandbox failure -> INCONCLUSIVE) and §11 (a plan that
  * needs an external write -> BLOCKED/approval_required_p0) require it and §7.1's literal list does not
- * cover them. WAITING_APPROVAL and RETRY_PENDING are P1 and intentionally absent.
+ * cover them. REFLECTING -> INCONCLUSIVE likewise carries §7.8's "Atlas unavailable during persistence". WAITING_APPROVAL and RETRY_PENDING are P1 and intentionally absent.
  */
 export const TRANSITIONS: Record<RunState, readonly RunState[]> = {
   CREATED: ["ADMITTED", "CANCELLED", "FAILED"],
@@ -87,7 +87,7 @@ export const TRANSITIONS: Record<RunState, readonly RunState[]> = {
   PLANNING: ["EXECUTING", "BLOCKED", "INCONCLUSIVE", "CANCELLED", "FAILED"],
   EXECUTING: ["EVALUATING", "BLOCKED", "INCONCLUSIVE", "CANCELLED", "FAILED"],
   EVALUATING: ["REFLECTING", "INCONCLUSIVE", "CANCELLED", "FAILED"],
-  REFLECTING: ["COMPLETE", "CANCELLED", "FAILED"],
+  REFLECTING: ["COMPLETE", "INCONCLUSIVE", "CANCELLED", "FAILED"],
   COMPLETE: [],
   BLOCKED: [],
   FAILED: [],
@@ -471,7 +471,7 @@ export const EventSchema = z.discriminatedUnion("type", [
   ),
   eventVariant(
     "model_output_invalid",
-    z.strictObject({ stage: z.enum(["plan", "step"]), attempt: z.int().positive(), issues: z.array(z.string()) }),
+    z.strictObject({ stage: z.enum(["plan", "step", "reflection"]), attempt: z.int().positive(), issues: z.array(z.string()) }),
   ),
   eventVariant("evaluation_recorded", z.strictObject({ evaluationId: Id, verdict: RunOutcome })),
   eventVariant(
@@ -566,6 +566,8 @@ export const MemoryCandidateSchema = z
       taskClass: NonEmpty.optional(),
       conditions: z.array(NonEmpty),
     }),
+    /** Machine-checkable conditions (e.g. `path:package.json`); a memory is excluded for a run that observes one false (PRD §9.6). */
+    preconditions: z.array(NonEmpty).optional(),
     evidenceStatus: EvidenceStatus,
     sourceRunIds: z.array(Id),
     evaluationIds: z.array(Id),
@@ -601,6 +603,8 @@ export const MemoryRecordSchema = z.strictObject({
     environment: z.string().optional(),
     toolVersions: z.record(z.string(), z.string()).optional(),
     conditions: z.array(NonEmpty),
+    /** The reflection's `does_not_apply_when` (PRD §12): where the lesson must not be applied. */
+    exclusions: z.array(NonEmpty).optional(),
   }),
   preconditions: z.array(z.string()),
   lifecycleState: LifecycleState,
