@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { z } from "zod";
 import { admitTask, createTask } from "./admission";
+import { createStubTools, defineTool } from "./adapters";
 import { FIXTURE_CREATE_TASK, FIXTURE_POLICY, FIXTURE_TASK, fixtureRegistry } from "./fixture";
+import { ToolRegistry } from "./permission";
 
 const server = { id: "t1", tenantId: "tn", requestedBy: "tester", createdAt: "2026-01-01T00:00:00.000Z", source: "live" as const };
 const reasons = (r: { ok: boolean; issues?: { reason: string }[] }) => (r.ok ? [] : (r.issues ?? []).map((i) => i.reason));
@@ -45,6 +48,21 @@ describe("admitTask (FR-01, INV-08)", () => {
     expect(reasons(admit({ ...FIXTURE_TASK, policyVersion: 2 }))).toContain("policy_mismatch");
     expect(reasons(admit(FIXTURE_TASK, { ...FIXTURE_POLICY, status: "DRAFT" }))).toContain("policy_not_active");
     expect(reasons(admit({ ...FIXTURE_TASK, riskClass: "high" }))).toContain("risk_exceeds_policy");
+  });
+
+  it("rejects an allowlisted external write until an approval workflow is configured", () => {
+    const postComment = defineTool({
+      name: "post_comment",
+      description: "post a comment",
+      inputSchema: z.strictObject({ body: z.string() }),
+      sideEffect: "external_write",
+      idempotent: false,
+      run: () => ({ ok: true, summary: "posted", observation: "posted" }),
+    });
+    const registry = new ToolRegistry("test", [...createStubTools(), postComment]);
+    const policy = { ...FIXTURE_POLICY, toolAllowlist: [...FIXTURE_POLICY.toolAllowlist, "post_comment"] };
+    expect(reasons(admitTask(FIXTURE_TASK, policy, registry))).toContain("external_write_not_permitted");
+    expect(admitTask(FIXTURE_TASK, policy, registry, { externalWrites: "defer" }).ok).toBe(true);
   });
 
   it("rejects a policy that allows an unregistered tool", () => {

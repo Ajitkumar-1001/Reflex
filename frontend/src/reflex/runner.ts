@@ -22,11 +22,16 @@ import type {
   TerminalState,
 } from "./contracts";
 import { admitTask } from "./admission";
+import { ApprovalAborted } from "./approval";
+import type { ApprovalService } from "./approval";
 import { WriteGate } from "./gate";
+import { effectKey } from "./ledger";
+import type { SideEffectLedger } from "./ledger";
 import type { GateConfig } from "./gate";
 import { LiveRecords } from "./live-records";
 import { MemoryService } from "./memory-service";
 import { authorizeToolCall, checkToolAccess } from "./permission";
+import { actionRequiresApproval, dispatchEffect } from "./tool-runner";
 import type { ToolRegistry } from "./permission";
 import {
   EmbedderUnavailableError,
@@ -58,6 +63,8 @@ import type {
   ToolOutput,
   Workspace,
 } from "./ports";
+import { RunHandoff } from "./execution/handoff";
+import type { CheckpointPhase, RunCheckpoint, RunExecution } from "./execution/types";
 import { episodicCandidate, parseReflection, redactReflection, reflectionCandidate } from "./reflection";
 import { HybridRetriever } from "./retrieval";
 import type { RetrievalConfig } from "./retrieval";
@@ -70,8 +77,9 @@ import type { z } from "zod";
  * Reference runner: a minimal in-process executor behind the RunEngine interface. Without `deps.memory` it is the
  * Phase 0 memory-off baseline (arm A) and its trace is byte-for-byte what Phase 0 recorded. With `deps.memory`
  * and a policy that enables it, the same loop retrieves bounded context before planning (arm B) and, outside a
- * frozen split, reflects and writes back through the gate. It is NOT the DEC-01 orchestration decision, and it is
- * non-durable: a process crash loses the run and nothing resumes it.
+ * frozen split, reflects and writes back through the gate. It is NOT the DEC-01 orchestration decision.
+ * Without `deps.execution` a process crash loses the run. With it, a checkpoint is written after each
+ * completed step and a later attempt continues from that step (Phase 2, DEC-03).
  */
 
 const PROMPT_TEMPLATE_VERSION = "p0-scripted-1";
@@ -139,6 +147,21 @@ export interface RunnerDeps {
   random?: () => number;
   /** Absent: memory is disabled whatever the policy says, and a policy that enables it is blocked. */
   memory?: MemoryRuntime;
+  /**
+   * Durable execution (Phase 2). Absent: this attempt is the non-durable loop and traces match Phase 0/1.
+   * Present: checkpoints are written at step boundaries, a stored checkpoint is resumed, and cancellation
+   * requested through it stops the run at the next boundary.
+   */
+  execution?: RunExecution;
+   * Phase 2 side effects. Absent: external writes stay denied and the trace matches the memory-off
+   * baseline. Present: mutations are ledgered before they run, and an action that requires approval pauses.
+   */
+  effects?: EffectRuntime;
+}
+
+export interface EffectRuntime {
+  ledger: SideEffectLedger;
+  approvals: ApprovalService;
 }
 
 const PERSIST_ATTEMPTS = 3; // PRD §7.8: persistence retries 3 times
@@ -167,48 +190,71 @@ export class ReferenceRunner implements RunEngine {
 
   async execute(request: RunRequest): Promise<RunResult> {
     const { model, registry, evaluator, workspace, commands, artifacts, clock, ids, sink } = this.deps;
+    const execution = this.deps.execution;
+    const saved = execution?.checkpoint ?? null;
+    if (saved && execution && saved.dispatchId !== execution.dispatchId) {
+      throw new Error(`checkpoint ${saved.dispatchId} does not match dispatch ${execution.dispatchId}`);
+    }
     const modelTimeoutMs = this.deps.modelTimeoutMs ?? DEFAULT_MODEL_TIMEOUT_MS;
     const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
     const random = this.deps.random ?? Math.random;
-    const admission = admitTask(request.task, request.policy, registry);
+    const effects = this.deps.effects;
+    const admission = admitTask(request.task, request.policy, registry, { externalWrites: effects ? "defer" : "deny" });
     if (!admission.ok) return { admitted: false, issues: admission.issues };
     const { task, policy } = admission;
+    if (saved?.phase === "terminal") {
+      if (!isTerminal(saved.run.status)) throw new Error(`terminal checkpoint for ${saved.dispatchId} is not terminal`);
+      return {
+        admitted: true,
+        run: RunSchema.parse(saved.run),
+        events: structuredClone(saved.events),
+        evaluation: saved.evaluation ? structuredClone(saved.evaluation) : null,
+      };
+    }
 
     const budget = effectiveBudget(task, policy);
-    const runId = ids.next("run");
-    const events: RunEvent[] = [];
+    const runId = saved ? saved.run.id : ids.next("run");
+    const events: RunEvent[] = saved ? structuredClone(saved.events) : [];
     const system: Actor = { kind: "system", id: "reference-runner" };
     const modelActor: Actor = { kind: "model", id: model.config.model };
-    const createdAt = clock.now();
-    const before = workspace.snapshot();
-    let evaluation: EvaluationResult | null = null;
+    const createdAt = saved ? new Date(saved.run.timestamps.createdAt) : clock.now();
+    const before = saved ? structuredClone(saved.before) : workspace.snapshot();
+    let evaluation: EvaluationResult | null = saved?.evaluation ?? null;
+    let plan: Plan | null = saved?.plan ?? null;
+    const observations: Observation[] = saved ? structuredClone(saved.observations) : [];
+    let denials = saved?.denials ?? 0;
+    let executionFinished = saved?.executionFinished ?? false;
+    let cards: MemoryCard[] = saved ? structuredClone(saved.cards) : [];
+    let memoryBlock = saved?.memoryBlock ?? "";
 
-    const run: Run = {
-      id: runId,
-      taskId: task.id,
-      status: "CREATED",
-      policyId: task.policyId,
-      policyVersion: task.policyVersion,
-      modelConfig: model.config,
-      promptTemplateVersion: PROMPT_TEMPLATE_VERSION,
-      toolRegistryVersion: registry.version,
-      retrievalSnapshot: { mode: "disabled", indexVersion: null },
-      configArm: policy.memoryRules.retrievalEnabled && this.deps.memory ? "B" : "A",
-      ...(request.experiment ? { experimentId: request.experiment.experimentId, trialIndex: request.experiment.trialIndex } : {}),
-      workspaceRef: workspace.ref,
-      startWorkspaceHash: workspace.hash(),
-      endWorkspaceHash: null,
-      budget,
-      steps: 0,
-      cost: { inputTokens: 0, outputTokens: 0, usd: 0, wallMs: 0 },
-      learningCost: { reflectionTokens: 0, gateTokens: 0 },
-      playbookVersion: null,
-      memoryContext: [],
-      evalSplit: task.split ?? "none",
-      timestamps: { createdAt: createdAt.toISOString(), updatedAt: createdAt.toISOString(), endedAt: null },
-      outcome: null,
-      outcomeReason: null,
-    };
+    const run: Run = saved
+      ? structuredClone(saved.run)
+      : {
+          id: runId,
+          taskId: task.id,
+          status: "CREATED",
+          policyId: task.policyId,
+          policyVersion: task.policyVersion,
+          modelConfig: model.config,
+          promptTemplateVersion: PROMPT_TEMPLATE_VERSION,
+          toolRegistryVersion: registry.version,
+          retrievalSnapshot: { mode: "disabled", indexVersion: null },
+          configArm: policy.memoryRules.retrievalEnabled && this.deps.memory ? "B" : "A",
+          ...(request.experiment ? { experimentId: request.experiment.experimentId, trialIndex: request.experiment.trialIndex } : {}),
+          workspaceRef: workspace.ref,
+          startWorkspaceHash: workspace.hash(),
+          endWorkspaceHash: null,
+          budget,
+          steps: 0,
+          cost: { inputTokens: 0, outputTokens: 0, usd: 0, wallMs: 0 },
+          learningCost: { reflectionTokens: 0, gateTokens: 0 },
+          playbookVersion: null,
+          memoryContext: [],
+          evalSplit: task.split ?? "none",
+          timestamps: { createdAt: createdAt.toISOString(), updatedAt: createdAt.toISOString(), endedAt: null },
+          outcome: null,
+          outcomeReason: null,
+        };
 
     const emit = <T extends RunEventType>(
       type: T,
@@ -246,15 +292,45 @@ export class ReferenceRunner implements RunEngine {
       run.timestamps.endedAt = event.timestamp;
     };
 
-    const checkLimits = (): void => {
-      run.cost.wallMs = Math.max(0, clock.now().getTime() - createdAt.getTime());
+    const throwIfCancelled = (): void => {
       if (request.signal?.aborted) {
         const shutdown = request.signal.reason === "shutdown";
         throw new Stop("CANCELLED", "cancelled", shutdown ? "shutdown" : "user_cancel", shutdown ? "process shutting down" : "cancellation requested");
       }
+      if (execution?.isCancelled()) throw new Stop("CANCELLED", "cancelled", "user_cancel", "cancellation requested");
+    };
+
+    const checkLimits = (): void => {
+      run.cost.wallMs = Math.max(0, clock.now().getTime() - createdAt.getTime());
+      throwIfCancelled();
       if (run.steps >= budget.maxSteps) throw new Stop("FAILED", "failed", "step_limit", `step limit ${budget.maxSteps} reached`);
       if (run.cost.usd > budget.maxUsd) throw new Stop("FAILED", "failed", "budget_exhausted", "cost budget exhausted");
       if (run.cost.wallMs > budget.maxWallMinutes * 60_000) throw new Stop("FAILED", "failed", "budget_exhausted", "wall-clock budget exhausted");
+    };
+
+    const capture = (phase: CheckpointPhase): RunCheckpoint => ({
+      version: 1,
+      dispatchId: execution?.dispatchId ?? "",
+      phase,
+      run: structuredClone(run),
+      events: structuredClone(events),
+      evaluation: evaluation ? structuredClone(evaluation) : null,
+      before: structuredClone(before),
+      workspace: workspace.snapshot(),
+      plan,
+      observations: structuredClone(observations),
+      denials,
+      executionFinished,
+      cards: structuredClone(cards),
+      memoryBlock,
+    });
+
+    // No await on the memory-off path: awaiting a resolved promise would yield, and the baseline trace
+    // is defined by how many times the stepping clock is read, not by microtasks.
+    const persist = (phase: CheckpointPhase): Promise<void> | void => {
+      if (!execution) return;
+      if (phase === "evaluated") executionFinished = true;
+      return execution.save(capture(phase));
     };
 
     /** One model call with the §7.8 provider and timeout retries; each retry is budget-checked and traced. */
@@ -379,18 +455,19 @@ export class ReferenceRunner implements RunEngine {
       }
     };
 
+    const accessContext = { task, policy, registry, externalWrite: effects ? ("defer" as const) : ("deny" as const) };
+
     const drive = async (): Promise<void> => {
-      moveTo("ADMITTED", "task admitted");
       const memory = this.deps.memory;
       const retrievalOn = policy.memoryRules.retrievalEnabled;
       const writebackOn = policy.memoryRules.writebackEnabled;
+      if (!saved) {
+      moveTo("ADMITTED", "task admitted");
       if ((retrievalOn || writebackOn) && !memory) {
         throw new Stop("BLOCKED", "blocked", "policy_denied", "policy enables memory but this runner is memory-disabled");
       }
 
       moveTo("RETRIEVING", "retrieval step");
-      let cards: MemoryCard[] = [];
-      let memoryBlock = "";
       if (retrievalOn && memory) {
         const retriever = new HybridRetriever(memory.repository, memory.records, memory.embedder, clock, memory.retrieval, memory.retention);
         try {
@@ -429,7 +506,7 @@ export class ReferenceRunner implements RunEngine {
       } else emit("retrieval_skipped", system, { reason: "memory_disabled" });
 
       moveTo("PLANNING", "planning");
-      const plan: Plan = await callModel("plan", PlanSchema, (validationError) =>
+      plan = await callModel("plan", PlanSchema, (validationError) =>
         model.plan({
           objective: task.objective,
           mode: task.mode,
@@ -449,11 +526,14 @@ export class ReferenceRunner implements RunEngine {
         );
       }
       for (const tool of plan.tools) {
-        const access = checkToolAccess(tool, { task, policy, registry });
+        const access = checkToolAccess(tool, accessContext);
         if ("denial" in access) {
           emit("policy_denied", system, { callId: null, tool: tool.slice(0, 100), ...access.denial });
           const reason = access.denial.reasonCode === "external_write_not_permitted" ? "approval_required_p0" : "policy_denied";
           throw new Stop("BLOCKED", "blocked", reason, `plan needs ${tool}: ${access.denial.reasonCode}`);
+        }
+        if (!effects && actionRequiresApproval(access.tool, policy.approvalRequirements)) {
+          throw new Stop("BLOCKED", "blocked", "approval_required_p0", `plan needs approval for ${tool}, and no approval workflow is configured`);
         }
       }
       emit("plan_recorded", modelActor, { plan });
@@ -464,16 +544,22 @@ export class ReferenceRunner implements RunEngine {
       }
 
       moveTo("EXECUTING", "executing plan");
-      const observations: Observation[] = [];
-      let denials = 0;
+      const entered = persist("executing");
+      if (entered) await entered;
+      }
+
+      if (saved?.phase !== "evaluated") {
+      if (!plan) throw new Error(`dispatch ${execution?.dispatchId ?? runId} has no plan to resume`);
+      const currentPlan = plan;
+      if (!executionFinished) {
       for (let finished = false; !finished; ) {
         checkLimits();
         const call = await callModel("step", ToolCallRequest, (validationError) =>
-          model.nextStep({ step: run.steps + 1, plan, observations, validationError }),
+          model.nextStep({ step: run.steps + 1, plan: currentPlan, observations, validationError }),
         );
         run.steps++;
         const callId = ids.next("call");
-        const decision = authorizeToolCall(call, { task, policy, registry });
+        const decision = authorizeToolCall(call, accessContext);
 
         if (!decision.allowed) {
           emit("policy_denied", modelActor, {
@@ -486,12 +572,17 @@ export class ReferenceRunner implements RunEngine {
           if (++denials >= MAX_DENIALS) {
             throw new Stop("BLOCKED", "blocked", "policy_denied", `${MAX_DENIALS} policy denials in one run`);
           }
+          const denied = persist("executing");
+          if (denied) await denied;
           continue;
         }
 
         const name = decision.tool.descriptor.name;
-        emit("tool_authorized", modelActor, { callId, tool: name, argsSummary: JSON.stringify(call.args).slice(0, 200) });
-        const startedMs = clock.now().getTime();
+        const argsSummary = JSON.stringify(decision.args).slice(0, 200);
+        if (!effects && actionRequiresApproval(decision.tool, policy.approvalRequirements)) {
+          throw new Stop("BLOCKED", "blocked", "approval_required_p0", `${name} requires approval, and no approval workflow is configured`);
+        }
+
         let output: ToolOutput;
         let infraFailure: InfraFailureError | null = null;
         try {
@@ -500,6 +591,7 @@ export class ReferenceRunner implements RunEngine {
             decision.tool.descriptor.timeoutMs,
           );
         } catch (error) {
+          if (error instanceof RunHandoff) throw error;
           if (error instanceof InfraFailureError) infraFailure = error;
           output =
             error instanceof InfraFailureError
@@ -507,9 +599,102 @@ export class ReferenceRunner implements RunEngine {
               : error instanceof TimedOut
               ? { ok: false, summary: "tool timed out", observation: `${name} timed out after ${decision.tool.descriptor.timeoutMs} ms` }
               : { ok: false, summary: "tool raised an error", observation: error instanceof Error ? error.message : "tool error" };
+        let effectKeyForEvent: string | undefined;
+        let startedMs: number;
+        if (effects) {
+          let approvalId: string | null = null;
+          if (actionRequiresApproval(decision.tool, policy.approvalRequirements)) {
+            const idempotencyKey = effectKey(runId, run.steps, name, decision.args).key;
+            const approval = effects.approvals.request({
+              runId,
+              taskId: task.id,
+              step: run.steps,
+              tool: name,
+              argsSummary,
+              idempotencyKey,
+              scope: {
+                tenantId: task.tenantId,
+                projectId: task.projectId,
+                repo: task.scope.repo,
+                commit: task.scope.commit,
+                ...(task.scope.paths ? { paths: [...task.scope.paths] } : {}),
+              },
+              requestedBy: task.requestedBy,
+            });
+            approvalId = approval.id;
+            moveTo("AWAITING_APPROVAL", `approval required for ${name}`);
+            try {
+              const resolved = await effects.approvals.wait(approval.id, request.signal);
+              if (resolved.status !== "approved") {
+                const reason = resolved.status === "expired" ? "approval_expired" : "approval_denied";
+                throw new Stop("BLOCKED", "blocked", reason, resolved.reason ?? reason);
+              }
+              moveTo("EXECUTING", `approval granted by ${resolved.decidedBy} for ${name}`);
+              checkLimits();
+            } catch (error) {
+              if (error instanceof ApprovalAborted) {
+                effects.approvals.failClosed(approval.id, "run cancelled while awaiting approval");
+                const shutdown = request.signal?.reason === "shutdown";
+                throw new Stop(
+                  "CANCELLED",
+                  "cancelled",
+                  shutdown ? "shutdown" : "user_cancel",
+                  shutdown ? "process shutting down" : "cancellation requested",
+                );
+              }
+              throw error;
+            }
+          }
+
+          startedMs = clock.now().getTime();
+          const dispatched = await dispatchEffect({
+            runId,
+            step: run.steps,
+            tool: decision.tool,
+            args: decision.args,
+            ctx: { workspace, scope: task.scope, commands, artifacts },
+            ledger: effects.ledger,
+            grants: effects.approvals.store,
+            approvalId,
+            approvalMarks: policy.approvalRequirements,
+            clock,
+            timeoutMs: decision.tool.descriptor.timeoutMs,
+          });
+          if (dispatched.kind === "blocked") {
+            const reason =
+              dispatched.reason === "approval_expired" ? "approval_expired" : dispatched.reason === "approval_denied" ? "approval_denied" : "approval_required_p0";
+            throw new Stop("BLOCKED", "blocked", reason, `unapproved ${name}: ${dispatched.reason}`);
+          }
+          if (dispatched.kind === "replayed") {
+            output = dispatched.output ?? { ok: false, summary: `effect ${dispatched.state}`, observation: "not executed again" };
+            effectKeyForEvent = dispatched.key;
+          } else {
+            output = dispatched.output;
+            infraFailure = dispatched.infraFailure;
+            effectKeyForEvent = dispatched.key ?? undefined;
+          }
+          emit("tool_authorized", modelActor, { callId, tool: name, argsSummary });
+        } else {
+          emit("tool_authorized", modelActor, { callId, tool: name, argsSummary });
+          startedMs = clock.now().getTime();
+          try {
+            output = await withTimeout(
+              decision.tool.execute(decision.args, { workspace, scope: task.scope, commands, artifacts }),
+              decision.tool.descriptor.timeoutMs,
+            );
+          } catch (error) {
+            if (error instanceof InfraFailureError) infraFailure = error;
+            output =
+              error instanceof InfraFailureError
+                ? { ok: false, summary: "sandbox unavailable", observation: error.message }
+                : error instanceof TimedOut
+                  ? { ok: false, summary: "tool timed out", observation: `${name} timed out after ${decision.tool.descriptor.timeoutMs} ms` }
+                  : { ok: false, summary: "tool raised an error", observation: error instanceof Error ? error.message : "tool error" };
+          }
+          effectKeyForEvent = decision.tool.descriptor.sideEffect === "read_only" ? undefined : `${runId}:${callId}`;
         }
         const durationMs = Math.max(0, clock.now().getTime() - startedMs);
-        const key = decision.tool.descriptor.sideEffect === "read_only" ? undefined : `${runId}:${callId}`;
+        const key = effectKeyForEvent;
         emit(
           "tool_result",
           { kind: "tool", id: name },
@@ -519,7 +704,12 @@ export class ReferenceRunner implements RunEngine {
         if (infraFailure) throw new Stop("INCONCLUSIVE", "inconclusive", "infra_failure", infraFailure.message);
         observations.push({ callId, tool: name, ok: output.ok, text: output.observation });
         finished = decision.tool.descriptor.endsExecution;
+        if (finished) executionFinished = true;
+        const stepped = persist("executing");
+        if (stepped) await stepped;
       }
+      }
+      throwIfCancelled();
 
       moveTo("EVALUATING", "execution ended");
       const evaluated = EvaluationSchema.parse(
@@ -549,6 +739,13 @@ export class ReferenceRunner implements RunEngine {
       if (evaluation.verdict === "inconclusive") {
         throw new Stop("INCONCLUSIVE", "inconclusive", evaluation.outcomeReason, "evaluation could not decide");
       }
+      const evaluatedCheckpoint = persist("evaluated");
+      if (evaluatedCheckpoint) await evaluatedCheckpoint;
+      }
+
+      if (!evaluation) throw new Error(`dispatch ${execution?.dispatchId ?? runId} resumed without an evaluation`);
+      const evaluated = evaluation;
+      throwIfCancelled();
       moveTo("REFLECTING", "reflection step");
       if (!memory || !writebackOn) {
         emit("reflection_skipped", system, { reason: retrievalOn ? "writeback_disabled" : "memory_disabled" });
@@ -562,16 +759,20 @@ export class ReferenceRunner implements RunEngine {
       stop("COMPLETE", evaluation.verdict, evaluation.outcomeReason, "evaluation recorded");
     };
 
-    emit("state_transition", system, { from: null, to: "CREATED", reason: "run created" });
+    if (!saved) emit("state_transition", system, { from: null, to: "CREATED", reason: "run created" });
     try {
       await drive();
     } catch (error) {
+      if (error instanceof RunHandoff) throw error;
       if (isTerminal(run.status)) throw error;
       if (error instanceof Stop) stop(error.state, error.outcome, error.reason, error.detail);
       else stop("FAILED", "failed", "internal_error", error instanceof Error ? error.message : "unknown error");
     }
 
     run.endWorkspaceHash = workspace.hash();
-    return { admitted: true, run: RunSchema.parse(run), events, evaluation };
+    const parsed = RunSchema.parse(run);
+    const terminal = persist("terminal");
+    if (terminal) await terminal;
+    return { admitted: true, run: parsed, events, evaluation };
   }
 }
