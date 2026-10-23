@@ -43,8 +43,17 @@ export function createTask(input: unknown, server: ServerTaskFields): TaskCreati
 
 export type Admission = { ok: true; task: Task; policy: Policy } | { ok: false; issues: AdmissionIssue[] };
 
-/** Admits a stored task against its pinned policy and the tool registry. */
-export function admitTask(taskInput: unknown, policyInput: unknown, registry: ToolRegistry): Admission {
+/**
+ * Admits a stored task against its pinned policy and the tool registry.
+ * `externalWrites: "defer"` is the Phase 2 approval path: an allowlisted external write is admitted,
+ * and the tool runner still refuses it without a grant. The default keeps the P0 rejection.
+ */
+export function admitTask(
+  taskInput: unknown,
+  policyInput: unknown,
+  registry: ToolRegistry,
+  options?: { externalWrites?: "deny" | "defer" },
+): Admission {
   const task = TaskSchema.safeParse(taskInput);
   const policy = PolicySchema.safeParse(policyInput);
   const issues: AdmissionIssue[] = [];
@@ -65,7 +74,7 @@ export function admitTask(taskInput: unknown, policyInput: unknown, registry: To
   for (const name of p.toolAllowlist) {
     const tool = registry.get(name);
     if (!tool) violation("unregistered_tool", `policy allows ${name}, which is not registered`);
-    else if (tool.descriptor.sideEffect === "external_write") {
+    else if (tool.descriptor.sideEffect === "external_write" && options?.externalWrites !== "defer") {
       violation("external_write_not_permitted", `policy allows ${name}; P0 has no approval path for external writes`);
     }
   }

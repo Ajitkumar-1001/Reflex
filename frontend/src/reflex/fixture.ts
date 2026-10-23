@@ -5,8 +5,9 @@ import { ToolRegistry } from "./permission";
 import { createTask } from "./admission";
 import { DEFAULT_COMMAND_ALLOWLIST } from "./contracts";
 import type { CreateTask, Plan, Policy, Task } from "./contracts";
-import type { CommandTable, EventSink, HiddenCheckBundle, ModelAdapter, RunResult } from "./ports";
+import type { Clock, CommandTable, EventSink, HiddenCheckBundle, IdGenerator, ModelAdapter, RunResult } from "./ports";
 import { ReferenceRunner } from "./runner";
+import type { EffectRuntime } from "./runner";
 
 /*
  * Phase 0 reference fixture ("fix-add-bug"): a one-file repository whose `add` subtracts.
@@ -161,6 +162,10 @@ export interface FixtureRunOptions {
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
   sink?: EventSink;
+  clock?: Clock;
+  ids?: IdGenerator;
+  /** Phase 2 ledger and approvals. Absent on the memory-off baseline. */
+  effects?: EffectRuntime;
 }
 
 /**
@@ -175,9 +180,10 @@ export function runFixture(options: FixtureRunOptions = {}): Promise<RunResult> 
     workspace: fixtureWorkspace(),
     commands: options.commands ?? FIXTURE_COMMANDS,
     artifacts: new InMemoryArtifactStore(),
-    clock: new SteppingClock(Date.UTC(2026, 0, 1), 10),
-    ids: new SequentialIds(),
+    clock: options.clock ?? new SteppingClock(Date.UTC(2026, 0, 1), 10),
+    ids: options.ids ?? new SequentialIds(),
     sink: options.sink,
+    effects: options.effects,
     modelTimeoutMs: options.modelTimeoutMs,
     sleep: options.sleep ?? (async () => {}),
     random: options.random ?? (() => 0.5),

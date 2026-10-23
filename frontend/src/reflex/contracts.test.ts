@@ -133,14 +133,14 @@ describe("state machine contract", () => {
       "COMPLETE/verified_failure": ["checks_failed"],
       "INCONCLUSIVE/inconclusive": ["evaluator_tamper_suspected", "infra_failure", "internal_error", "missing_checks", "model_unavailable"],
       "FAILED/failed": ["budget_exhausted", "internal_error", "malformed_model_output", "step_limit"],
-      "BLOCKED/blocked": ["approval_required_p0", "cloud_not_permitted", "policy_denied"],
+      "BLOCKED/blocked": ["approval_denied", "approval_expired", "approval_required_p0", "cloud_not_permitted", "policy_denied"],
       "CANCELLED/cancelled": ["shutdown", "user_cancel"],
     });
   });
 
-  it("has exactly the v1.4 states: P1's WAITING_APPROVAL and RETRY_PENDING are absent", () => {
+  it("has the v1.4 states plus Phase 2 AWAITING_APPROVAL; RETRY_PENDING is still absent", () => {
     expect(RunState.options).toEqual([
-      "CREATED", "ADMITTED", "RETRIEVING", "PLANNING", "EXECUTING", "EVALUATING", "REFLECTING",
+      "CREATED", "ADMITTED", "RETRIEVING", "PLANNING", "EXECUTING", "AWAITING_APPROVAL", "EVALUATING", "REFLECTING",
       "COMPLETE", "BLOCKED", "FAILED", "CANCELLED", "INCONCLUSIVE",
     ]);
   });
@@ -155,6 +155,10 @@ describe("state machine contract", () => {
     }
     expect(canTransition("RETRIEVING", "INCONCLUSIVE")).toBe(false); // retrieval failure continues the run (§7.8)
     expect(canTransition("EXECUTING", "COMPLETE")).toBe(false);
+    expect(canTransition("EXECUTING", "AWAITING_APPROVAL")).toBe(true);
+    expect(canTransition("AWAITING_APPROVAL", "EXECUTING")).toBe(true);
+    expect(canTransition("AWAITING_APPROVAL", "BLOCKED")).toBe(true);
+    expect(canTransition("AWAITING_APPROVAL", "COMPLETE")).toBe(false);
   });
 
   it("maps each terminal state to honest outcomes (INV-09)", () => {

@@ -22,23 +22,28 @@ export interface AccessContext {
   task: Task;
   policy: Policy;
   registry: ToolRegistry;
+  /**
+   * `deny` (default) refuses every external write: P0 has no approval path. `defer` leaves that check to
+   * the tool runner, which still refuses the call unless a grant is on record.
+   */
+  externalWrite?: "deny" | "defer";
 }
 
 /** Argument-independent checks, shared by plan validation and per-call authorization. */
 export function checkToolAccess(
   toolName: string,
-  { task, policy, registry }: AccessContext,
+  { task, policy, registry, externalWrite = "deny" }: AccessContext,
 ): { tool: ToolAdapter } | { denial: Denial } {
   const tool = registry.get(toolName);
   if (!tool) return { denial: { reasonCode: "unregistered_tool", detail: `no tool named ${toolName}` } };
   const { sideEffect } = tool.descriptor;
-  if (sideEffect === "external_write") {
+  if (sideEffect === "external_write" && externalWrite !== "defer") {
     return { denial: { reasonCode: "external_write_not_permitted", detail: "external writes need approval, which P0 lacks" } };
   }
   if (!policy.toolAllowlist.includes(toolName)) {
     return { denial: { reasonCode: "tool_not_in_policy", detail: `${toolName} is not in the policy allowlist` } };
   }
-  if (sideEffect === "workspace_write" && task.mode === "investigate") {
+  if (sideEffect !== "read_only" && task.mode === "investigate") {
     return { denial: { reasonCode: "write_in_investigation_mode", detail: "investigation tasks cannot write" } };
   }
   return { tool };
