@@ -14,7 +14,7 @@ export interface Principal {
   projectIds: readonly string[];
 }
 
-export type Action = "read" | "feedback" | "decide" | "quarantine" | "unquarantine";
+export type Action = "read" | "feedback" | "decide" | "quarantine" | "unquarantine" | "approve";
 
 const ALLOWED: Record<Action, readonly Role[]> = {
   read: ["owner", "runner", "cody-service", "viewer"],
@@ -22,6 +22,8 @@ const ALLOWED: Record<Action, readonly Role[]> = {
   decide: ["owner"],
   quarantine: ["owner"],
   unquarantine: ["owner"],
+  /** An external mutation. Owner only, separate from a memory `decide`, so the runner cannot approve its own call. */
+  approve: ["owner"],
 };
 
 /** Error classes carry the PRD §15.1 code so a route handler can map them to a status without parsing prose. */

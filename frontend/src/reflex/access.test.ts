@@ -20,6 +20,7 @@ describe("memory role matrix (PRD §17.0, FR-29), server-side", () => {
     decide: { owner: true, runner: false, "cody-service": false, viewer: false },
     quarantine: { owner: true, runner: false, "cody-service": false, viewer: false },
     unquarantine: { owner: true, runner: false, "cody-service": false, viewer: false },
+    approve: { owner: true, runner: false, "cody-service": false, viewer: false },
   };
 
   for (const [action, roles] of Object.entries(matrix) as [Action, Record<Role, boolean>][]) {
