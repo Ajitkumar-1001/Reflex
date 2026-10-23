@@ -338,8 +338,9 @@ memory-off. The in-memory `JobQueue` is the only adapter. DEC-03 (BullMQ/Redis) 
 | Checkpoints | Written after the plan is committed, after each tool step (including a denial), after evaluation, and when the run is terminal. A crash mid-step leaves the previous snapshot; the partial workspace write is discarded |
 | Resume | The next attempt restores the run, the trace, id counters, and the stepping clock, and continues at the next step. A terminal checkpoint is returned and not executed again, so a lost ack does not repeat side effects |
 | Cancel | `cancel(dispatchId)` is read at the next step boundary (also before evaluation and reflection). The run stops `CANCELLED` / `cancelled` / `user_cancel`. The in-flight step is allowed to finish |
+| Paused for approval | A run that reaches an approval-required tool checkpoints in `AWAITING_APPROVAL` (with the call it paused on) and the attempt ends as `paused`; the job is offered again after the base backoff and no attempt is charged. A resume reads the approval: pending pauses again, approved continues, denied or expired ends `BLOCKED` (`approval_denied` / `approval_expired`), a cancel ends `CANCELLED` and closes the request. The ledger keeps the mutation to once |
 
-Cancellation uses the existing state machine. The status is `CANCELLED`; the outcome is `cancelled`. No new state was added (`WAITING_APPROVAL` and `RETRY_PENDING` stay absent).
+Cancellation uses the existing state machine. The status is `CANCELLED`; the outcome is `cancelled`. No new state was added for it (`RETRY_PENDING` stays absent; `AWAITING_APPROVAL` is the ledger workstream's pause, below).
 
 A crash during `REFLECTING` resumes at the post-evaluation checkpoint, so reflection runs again. Memory rows already inserted by that attempt are not part of the checkpoint (the memory store is the Phase 1 repository). Artifact blobs are not in the checkpoint either; retention of traces and artifacts is the other Phase 2 workstream. The `409 run_active` index is still not built. `recoverInterruptedRun` is unchanged and still marks a bare, non-leased run `FAILED/internal_error`.
 
@@ -401,7 +402,7 @@ Cancelling while paused does not run the mutation. The idempotency key on the `t
 - The approver role is `owner`. A runner, viewer, or cody-service principal is rejected and the request stays pending.
 - The grant lasts 24 hours unless the caller passes `ttlMs`. The PRD does not give a number.
 - A tool timeout or a thrown tool settles the ledger `failed` and is not dispatched again.
-- `recoverInterruptedRun` still marks a paused run `FAILED/internal_error`. Resuming it across a process is the queue workstream's checkpoint, not this ledger.
+- `recoverInterruptedRun` still marks a bare paused run `FAILED/internal_error`. Under the durable worker a paused run resumes from its checkpoint (workstream A, "Paused for approval"). The approval and ledger records are in-memory, so a real process restart needs them durable too.
 
 ## Deferred
 
