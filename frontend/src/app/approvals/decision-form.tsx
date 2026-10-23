@@ -19,6 +19,7 @@ export function DecisionForm({ id, returnStatus }: { id: string; returnStatus: s
         id={reasonId}
         name="reason"
         required
+        // Keep in step with DECISION_REASON_MAX in client/approvals.ts, which the server enforces. Not imported: that would pull Zod into this client bundle.
         maxLength={240}
         disabled={pending}
         className="rounded-md border border-border bg-card px-2 py-1.5 text-sm"

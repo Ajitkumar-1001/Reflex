@@ -4,6 +4,8 @@
  * below is for tests: same inputs and errors, with no Reflex domain imports.
  */
 
+import { z } from "zod";
+
 export const APPROVAL_STATUSES = ["pending", "approved", "denied", "expired"] as const;
 export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 
@@ -77,6 +79,30 @@ export function parseApprovalStatus(
     return { ok: false, message: STATUS_MESSAGE };
   }
   return { ok: true, status: trimmed };
+}
+
+/** The most a decision's reason may hold. The form's `maxLength` in `decision-form.tsx` promises the same number. */
+const DECISION_REASON_MAX = 240;
+
+const DecisionFormSchema = z.object({
+  id: z.string({ error: "Missing approval id." }).min(1, "Missing approval id.").max(128, "Approval id is too long."),
+  decision: z.enum(["approve", "deny"], { error: "Choose approve or deny." }),
+  reason: z
+    .string({ error: "A decision needs a reason." })
+    .trim()
+    .min(1, "A decision needs a reason.")
+    .max(DECISION_REASON_MAX, `A reason is at most ${DECISION_REASON_MAX} characters.`),
+});
+
+/** Boundary parser for the approve/deny form. The first problem, in field order, becomes the message. */
+export function parseDecisionForm(fields: {
+  id: unknown;
+  decision: unknown;
+  reason: unknown;
+}): { ok: true; id: string; decision: ApprovalDecision; reason: string } | { ok: false; message: string } {
+  const parsed = DecisionFormSchema.safeParse(fields);
+  if (!parsed.success) return { ok: false, message: parsed.error.issues[0].message };
+  return { ok: true, ...parsed.data };
 }
 
 /**
