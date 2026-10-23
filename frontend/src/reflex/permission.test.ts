@@ -38,7 +38,7 @@ describe("authorizeToolCall (FR-06, INV-02, INV-08)", () => {
     );
   });
 
-  it("denies external writes in P0 even when task and policy both list the tool", () => {
+  it("denies external writes in P0 whether or not the policy lists the tool", () => {
     const postComment = defineTool({
       name: "post_comment",
       description: "post a comment",
@@ -50,6 +50,9 @@ describe("authorizeToolCall (FR-06, INV-02, INV-08)", () => {
     const registry = new ToolRegistry("test", [...createStubTools(), postComment]);
     const policy = { ...FIXTURE_POLICY, toolAllowlist: [...FIXTURE_POLICY.toolAllowlist, "post_comment"] };
     expect(reasonOf(authorizeToolCall(call("post_comment", { body: "hi" }), ctx(FIXTURE_TASK, policy, registry)))).toBe(
+      "external_write_not_permitted",
+    );
+    expect(reasonOf(authorizeToolCall(call("post_comment", { body: "hi" }), ctx(FIXTURE_TASK, FIXTURE_POLICY, registry)))).toBe(
       "external_write_not_permitted",
     );
   });

@@ -31,12 +31,12 @@ export function checkToolAccess(
 ): { tool: ToolAdapter } | { denial: Denial } {
   const tool = registry.get(toolName);
   if (!tool) return { denial: { reasonCode: "unregistered_tool", detail: `no tool named ${toolName}` } };
-  if (!policy.toolAllowlist.includes(toolName)) {
-    return { denial: { reasonCode: "tool_not_in_policy", detail: `${toolName} is not in the policy allowlist` } };
-  }
   const { sideEffect } = tool.descriptor;
   if (sideEffect === "external_write") {
     return { denial: { reasonCode: "external_write_not_permitted", detail: "external writes need approval, which P0 lacks" } };
+  }
+  if (!policy.toolAllowlist.includes(toolName)) {
+    return { denial: { reasonCode: "tool_not_in_policy", detail: `${toolName} is not in the policy allowlist` } };
   }
   if (sideEffect === "workspace_write" && task.mode === "investigate") {
     return { denial: { reasonCode: "write_in_investigation_mode", detail: "investigation tasks cannot write" } };

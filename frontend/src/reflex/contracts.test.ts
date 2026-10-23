@@ -126,6 +126,37 @@ describe("state machine contract", () => {
     }
   });
 
+  it("matches the PRD v1.4 §7.1 state/outcome/reason table, plus §7.8's INCONCLUSIVE/internal_error", () => {
+    const table = Object.fromEntries(TERMINAL_RESULTS.map((r) => [`${r.state}/${r.outcome}`, [...r.reasons].sort()]));
+    expect(table).toEqual({
+      "COMPLETE/verified_success": ["checks_passed"],
+      "COMPLETE/verified_failure": ["checks_failed"],
+      "INCONCLUSIVE/inconclusive": ["evaluator_tamper_suspected", "infra_failure", "internal_error", "missing_checks", "model_unavailable"],
+      "FAILED/failed": ["budget_exhausted", "internal_error", "malformed_model_output", "step_limit"],
+      "BLOCKED/blocked": ["approval_required_p0", "cloud_not_permitted", "policy_denied"],
+      "CANCELLED/cancelled": ["shutdown", "user_cancel"],
+    });
+  });
+
+  it("has exactly the v1.4 states: P1's WAITING_APPROVAL and RETRY_PENDING are absent", () => {
+    expect(RunState.options).toEqual([
+      "CREATED", "ADMITTED", "RETRIEVING", "PLANNING", "EXECUTING", "EVALUATING", "REFLECTING",
+      "COMPLETE", "BLOCKED", "FAILED", "CANCELLED", "INCONCLUSIVE",
+    ]);
+  });
+
+  it("applies the §7.1 transition rules, and the wider BLOCKED/INCONCLUSIVE edges that §7.8 and §11 require", () => {
+    expect(canTransition("ADMITTED", "BLOCKED")).toBe(true);
+    expect(canTransition("EVALUATING", "INCONCLUSIVE")).toBe(true);
+    expect(canTransition("REFLECTING", "COMPLETE")).toBe(true);
+    for (const from of ["PLANNING", "EXECUTING"] as const) {
+      expect(canTransition(from, "BLOCKED")).toBe(true);
+      expect(canTransition(from, "INCONCLUSIVE")).toBe(true);
+    }
+    expect(canTransition("RETRIEVING", "INCONCLUSIVE")).toBe(false); // retrieval failure continues the run (§7.8)
+    expect(canTransition("EXECUTING", "COMPLETE")).toBe(false);
+  });
+
   it("maps each terminal state to honest outcomes (INV-09)", () => {
     expect(isLegalTerminalResult("COMPLETE", "verified_success", "checks_passed")).toBe(true);
     expect(isLegalTerminalResult("COMPLETE", "verified_success", "checks_failed")).toBe(false);

@@ -196,7 +196,10 @@ export class ReferenceRunner implements RunEngine {
 
     const checkLimits = (): void => {
       run.cost.wallMs = Math.max(0, clock.now().getTime() - createdAt.getTime());
-      if (request.signal?.aborted) throw new Stop("CANCELLED", "cancelled", "user_cancel", "cancellation requested");
+      if (request.signal?.aborted) {
+        const shutdown = request.signal.reason === "shutdown";
+        throw new Stop("CANCELLED", "cancelled", shutdown ? "shutdown" : "user_cancel", shutdown ? "process shutting down" : "cancellation requested");
+      }
       if (run.steps >= budget.maxSteps) throw new Stop("FAILED", "failed", "step_limit", `step limit ${budget.maxSteps} reached`);
       if (run.cost.usd > budget.maxUsd) throw new Stop("FAILED", "failed", "budget_exhausted", "cost budget exhausted");
       if (run.cost.wallMs > budget.maxWallMinutes * 60_000) throw new Stop("FAILED", "failed", "budget_exhausted", "wall-clock budget exhausted");

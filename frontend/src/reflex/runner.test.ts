@@ -139,7 +139,7 @@ describe("tool permission enforcement (FR-06)", () => {
     const denials = events.flatMap((e) => (e.type === "policy_denied" ? [e.redactedPayload] : []));
     expect(denials.map((d) => [d.tool, d.reasonCode])).toEqual([
       ["git_push", "unregistered_tool"],
-      ["post_comment", "tool_not_in_policy"],
+      ["post_comment", "external_write_not_permitted"],
     ]);
 
     const audit = auditTrace(events);
