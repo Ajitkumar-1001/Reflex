@@ -169,6 +169,25 @@ describe("filters applied before and after ranking (FR-04, FR-22; Phase 1 exit g
     expect(ids(await retriever(l).retrieve(query(probe)))).toEqual(["m-clean"]);
   });
 
+  it("excludes an approved memory whose source run is quarantined even if the memory itself was never transitioned", async () => {
+    const l = lab();
+    const { arithmeticTask } = await import("./memory-fixture");
+    const { run } = await l.run({ op: "add", task: arithmeticTask("add", { id: "task-add-1" }), memory: false });
+    await l.seed({ id: "m-approved", text: OPERATOR, sourceRunIds: [run.id] });
+    await l.store.appendEvent({
+      id: "q1",
+      runId: run.id,
+      sequence: await l.store.nextSequence(run.id),
+      actor: { kind: "user", id: "ajit" },
+      timestamp: "2026-01-01T00:00:00.000Z",
+      type: "quarantine_recorded",
+      redactedPayload: { selector: "run", memoryIds: [], runIds: [run.id], reason: "bad", restored: false },
+    });
+    const r = await retriever(l).retrieve(query(probe));
+    expect(r.cards).toEqual([]);
+    expect(r.excluded.source_quarantined).toBe(1);
+  });
+
   it("does not compare vectors from another embedding version: the memory falls back to lexical only until re-embedded (§9.2)", async () => {
     const l = lab();
     await l.seed({ id: "m-old", text: OPERATOR, embeddingVersion: "0" });
