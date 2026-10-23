@@ -1,6 +1,7 @@
 import { effectKey } from "./ledger";
 import type { SideEffectLedger } from "./ledger";
 import type { ApprovalRequest, ApprovalStore } from "./approval";
+import { RunHandoff } from "./execution/handoff";
 import { InfraFailureError } from "./ports";
 import type { Clock, ToolAdapter, ToolContext, ToolOutput } from "./ports";
 
@@ -62,6 +63,8 @@ async function runTool(tool: ToolAdapter, args: unknown, ctx: ToolContext, timeo
   try {
     return { output: await withTimeout(tool.execute(args, ctx), timeoutMs), infraFailure: null };
   } catch (error) {
+    // A crash or lost lease hands the run back to the worker. The ledger row stays `intended`, so the resumed attempt does not run the mutation again.
+    if (error instanceof RunHandoff) throw error;
     if (error instanceof InfraFailureError) {
       return { output: { ok: false, summary: "sandbox unavailable", observation: error.message }, infraFailure: error };
     }
