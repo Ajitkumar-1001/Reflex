@@ -109,7 +109,7 @@ describe("task contract (FR-01, PRD §15.2)", () => {
 });
 
 describe("state machine contract", () => {
-  it("allows the v1.0 main path", () => {
+  it("allows the §7.1 main path", () => {
     const path = ["CREATED", "ADMITTED", "RETRIEVING", "PLANNING", "EXECUTING", "EVALUATING", "REFLECTING", "COMPLETE"] as const;
     for (let i = 1; i < path.length; i++) expect(canTransition(path[i - 1], path[i])).toBe(true);
   });
