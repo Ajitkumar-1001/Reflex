@@ -22,25 +22,38 @@ import type {
 
 /** Advances a fixed step per read, so repeated runs produce identical timestamps. */
 export class SteppingClock implements Clock {
-  private tick = 0;
-
   constructor(
     private readonly startMs: number,
     private readonly stepMs: number,
+    private tick = 0,
   ) {}
 
   now(): Date {
     return new Date(this.startMs + this.stepMs * this.tick++);
   }
+
+  /** The next tick a resumed clock should use. Does not advance time. */
+  snapshot(): { startMs: number; stepMs: number; tick: number } {
+    return { startMs: this.startMs, stepMs: this.stepMs, tick: this.tick };
+  }
 }
 
 export class SequentialIds implements IdGenerator {
-  private readonly counters = new Map<string, number>();
+  private readonly counters: Map<string, number>;
+
+  constructor(seed: Readonly<Record<string, number>> = {}) {
+    this.counters = new Map(Object.entries(seed));
+  }
 
   next(prefix: string): string {
     const n = (this.counters.get(prefix) ?? 0) + 1;
     this.counters.set(prefix, n);
     return `${prefix}-${n}`;
+  }
+
+  /** Last issued number per prefix, so a resumed attempt keeps issuing fresh ids. */
+  snapshot(): Record<string, number> {
+    return Object.fromEntries(this.counters);
   }
 }
 
