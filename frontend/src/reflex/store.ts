@@ -135,6 +135,15 @@ export class InMemoryStore implements RunRecords {
     return copy(this.events.get(runId) ?? []);
   }
 
+  async memoryEvents(memoryId: string): Promise<readonly RunEvent[]> {
+    return copy(
+      [...this.events.values()]
+        .flat()
+        .filter((e) => (e.type === "memory_use" || e.type === "memory_lifecycle") && e.redactedPayload.memoryId === memoryId)
+        .sort((a, b) => (a.timestamp < b.timestamp ? -1 : a.timestamp > b.timestamp ? 1 : a.id < b.id ? -1 : 1)),
+    );
+  }
+
   async nextSequence(runId: string): Promise<number> {
     return (this.events.get(runId)?.length ?? 0) + 1;
   }

@@ -1,5 +1,5 @@
 import { cosine } from "./embedder";
-import type { MemoryRecord } from "./contracts";
+import type { LifecycleState, MemoryKind, MemoryRecord } from "./contracts";
 import { EmbedderUnavailableError, RepositoryUnavailableError } from "./ports";
 import type { Clock, Embedder, MemoryCard, MemoryRepository, RunRecords } from "./ports";
 import { DAY_MS, PROPOSED_RETENTION } from "./retention";
@@ -86,6 +86,14 @@ export interface RetrievalResult {
   embeddingVersion: string;
 }
 
+interface Ranked {
+  m: MemoryRecord;
+  bm25: number;
+  coverage: number;
+  vector: number | null;
+  score: number;
+}
+
 const RETRIEVABLE_KINDS = ["episodic", "semantic", "procedural"] as const; // playbook items are assembled separately (DEC-13)
 const MAX_CARD_CHARS = 600;
 const BM25_K1 = 1.2;
@@ -168,6 +176,70 @@ export class HybridRetriever {
       return true;
     });
 
+    const ranked = await this.rank(eligible, query, now, drop);
+
+    const cards: MemoryCard[] = [];
+    const trace: RetrievalTraceEntry[] = [];
+    let tokens = ranked.length > 0 ? estimateTokens(HEADER) + estimateTokens(FOOTER) : 0;
+    for (const [i, s] of ranked.entries()) {
+      const card: MemoryCard = {
+        memoryId: s.m.id,
+        version: s.m.version,
+        kind: s.m.kind,
+        text: s.m.text,
+        confidence: s.m.confidence,
+        rank: cards.length + 1,
+        score: s.score,
+        appliesWhen: s.m.scope.conditions,
+        doesNotApplyWhen: s.m.scope.exclusions ?? [],
+        provenance: { sourceRunIds: s.m.sourceRunIds, evaluationIds: s.m.evaluationIds, lastVerifiedAt: s.m.lastVerifiedAt },
+      };
+      const cost = estimateTokens(renderCard(card));
+      const fits = cards.length < maxCards && tokens + cost <= maxTokens;
+      if (fits) {
+        cards.push(card);
+        tokens += cost;
+      } else drop("over_budget");
+      trace.push({ memoryId: s.m.id, version: s.m.version, rank: i + 1, score: s.score, injected: fits });
+    }
+    if (cards.length === 0) tokens = 0;
+
+    return {
+      cards,
+      context: renderMemoryContext(cards),
+      contextTokens: tokens,
+      considered: pool.length,
+      excluded,
+      trace,
+      indexVersion: config.indexVersion,
+      embeddingModel: this.embedder.model,
+      embeddingVersion: this.embedder.version,
+    };
+  }
+
+  /**
+   * Hybrid search for the memory explorer (PRD §16): the same scoring over any lifecycle state in one project,
+   * with no validity-window, scope or budget filtering, so stale and quarantined memory can be inspected.
+   */
+  async search(
+    query: RetrievalQuery,
+    options: { lifecycleStates: readonly LifecycleState[]; kinds?: readonly MemoryKind[]; k: number },
+  ): Promise<{ memory: MemoryRecord; score: number }[]> {
+    const pool = (await this.repo.find({ tenantId: query.tenantId, projectId: query.projectId, lifecycleStates: options.lifecycleStates, kinds: options.kinds })).filter(
+      (m) => m.tenantId === query.tenantId && m.projectId === query.projectId,
+    );
+    const ranked = await this.rank(pool, query, this.clock.now().getTime(), () => {});
+    return ranked.slice(0, options.k).map((r) => ({ memory: r.m, score: r.score }));
+  }
+
+  /** Lexical + vector scores, relevance threshold, weighted RRF and rerank over an already filtered pool. */
+  private async rank(
+    eligible: readonly MemoryRecord[],
+    query: RetrievalQuery,
+    now: number,
+    drop: (reason: string) => void,
+  ): Promise<Ranked[]> {
+    const { config } = this;
     const stamp = { model: this.embedder.model, version: this.embedder.version };
     const queryVector = await this.embedder.embed(query.text);
     const queryTerms = [...new Set(tokenize(query.text))];
@@ -226,44 +298,7 @@ export class HybridRetriever {
         return { ...s, score };
       })
       .sort((a, b) => b.score - a.score || byId(a, b));
-
-    const cards: MemoryCard[] = [];
-    const trace: RetrievalTraceEntry[] = [];
-    let tokens = ranked.length > 0 ? estimateTokens(HEADER) + estimateTokens(FOOTER) : 0;
-    for (const [i, s] of ranked.entries()) {
-      const card: MemoryCard = {
-        memoryId: s.m.id,
-        version: s.m.version,
-        kind: s.m.kind,
-        text: s.m.text,
-        confidence: s.m.confidence,
-        rank: cards.length + 1,
-        score: s.score,
-        appliesWhen: s.m.scope.conditions,
-        doesNotApplyWhen: s.m.scope.exclusions ?? [],
-        provenance: { sourceRunIds: s.m.sourceRunIds, evaluationIds: s.m.evaluationIds, lastVerifiedAt: s.m.lastVerifiedAt },
-      };
-      const cost = estimateTokens(renderCard(card));
-      const fits = cards.length < maxCards && tokens + cost <= maxTokens;
-      if (fits) {
-        cards.push(card);
-        tokens += cost;
-      } else drop("over_budget");
-      trace.push({ memoryId: s.m.id, version: s.m.version, rank: i + 1, score: s.score, injected: fits });
-    }
-    if (cards.length === 0) tokens = 0;
-
-    return {
-      cards,
-      context: renderMemoryContext(cards),
-      contextTokens: tokens,
-      considered: pool.length,
-      excluded,
-      trace,
-      indexVersion: config.indexVersion,
-      embeddingModel: stamp.model,
-      embeddingVersion: stamp.version,
-    };
+    return ranked;
   }
 }
 

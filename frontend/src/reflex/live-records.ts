@@ -34,6 +34,11 @@ export class LiveRecords implements RunRecords {
     return runId === this.live.run.id ? structuredClone(this.live.events) : this.base.getEvents(runId);
   }
 
+  async memoryEvents(memoryId: string): Promise<readonly RunEvent[]> {
+    const live = this.live.events.filter((e) => (e.type === "memory_use" || e.type === "memory_lifecycle") && e.redactedPayload.memoryId === memoryId);
+    return [...(await this.base.memoryEvents(memoryId)), ...structuredClone(live)];
+  }
+
   async nextSequence(runId: string): Promise<number> {
     return runId === this.live.run.id ? this.live.events.length + 1 : this.base.nextSequence(runId);
   }

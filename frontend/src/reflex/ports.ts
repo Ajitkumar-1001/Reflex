@@ -296,6 +296,8 @@ export interface RunRecords {
   getRun(id: string): Promise<Run | undefined>;
   getEvaluation(id: string): Promise<EvaluationResult | undefined>;
   getEvents(runId: string): Promise<readonly RunEvent[]>;
+  /** `memory_use` and `memory_lifecycle` events for one memory, oldest first: the §10 partial index on events by memory. */
+  memoryEvents(memoryId: string): Promise<readonly RunEvent[]>;
   /** The next free `(run_id, sequence)` slot. */
   nextSequence(runId: string): Promise<number>;
   appendEvent(event: RunEvent): Promise<void>;
