@@ -262,6 +262,9 @@ describe("memory contracts (PRD §9.5, §9.6, §10)", () => {
     gateDecision: null,
     derivedFromMemoryIds: [],
     contentHash: "sha256:abc",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    lastUsedAt: null,
   };
 
   it("has the v1.4 kinds and the single lifecycle_state field with its eight values", () => {
@@ -272,6 +275,7 @@ describe("memory contracts (PRD §9.5, §9.6, §10)", () => {
     expect(MemoryRecordSchema.safeParse(record).success).toBe(true);
     expect(MemoryRecordSchema.safeParse({ ...record, status: "approved" }).success).toBe(false);
     expect(MemoryRecordSchema.safeParse({ ...record, lifecycleState: "pending" }).success).toBe(false);
+    expect(MemoryRecordSchema.safeParse({ ...record, lastUsedAt: undefined }).success).toBe(false);
   });
 
   it("follows the §9.6 lifecycle transitions", () => {

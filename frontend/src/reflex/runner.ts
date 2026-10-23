@@ -22,31 +22,56 @@ import type {
   TerminalState,
 } from "./contracts";
 import { admitTask } from "./admission";
+import { WriteGate } from "./gate";
+import type { GateConfig } from "./gate";
+import { LiveRecords } from "./live-records";
+import { MemoryService } from "./memory-service";
 import { authorizeToolCall, checkToolAccess } from "./permission";
 import type { ToolRegistry } from "./permission";
-import { InfraFailureError, ModelUnavailableError } from "./ports";
+import {
+  EmbedderUnavailableError,
+  FrozenMemoryError,
+  InfraFailureError,
+  ModelUnavailableError,
+  ReflectorUnavailableError,
+  RepositoryUnavailableError,
+} from "./ports";
 import type {
   ArtifactStore,
   Clock,
   CommandTable,
+  Embedder,
   EventSink,
   Evaluator,
   IdGenerator,
+  MemoryCard,
+  MemoryJudge,
+  MemoryRepository,
   ModelAdapter,
   ModelResponse,
   Observation,
+  Reflector,
   RunEngine,
+  RunRecords,
   RunRequest,
   RunResult,
   ToolOutput,
   Workspace,
 } from "./ports";
+import { episodicCandidate, parseReflection, redactReflection, reflectionCandidate } from "./reflection";
+import { HybridRetriever } from "./retrieval";
+import type { RetrievalConfig } from "./retrieval";
+import type { RetentionConfig } from "./retention";
+import { PROPOSED_RETENTION } from "./retention";
+import { MemoryWriteback } from "./writeback";
 import type { z } from "zod";
 
 /*
- * Phase 0 reference runner: a minimal in-process, memory-disabled executor behind the
- * RunEngine interface. It is the Phase 0 baseline, NOT the DEC-01 orchestration decision,
- * and it is non-durable: a process crash loses the run and nothing resumes it.
+ * Reference runner: a minimal in-process executor behind the RunEngine interface. Without `deps.memory` it is the
+ * Phase 0 memory-off baseline (arm A) and its trace is byte-for-byte what Phase 0 recorded. With `deps.memory`
+ * and a policy that enables it, the same loop retrieves bounded context before planning (arm B) and, outside a
+ * frozen split, reflects and writes back through the gate. It is NOT the DEC-01 orchestration decision, and it is
+ * non-durable: a process crash loses the run and nothing resumes it.
  */
 
 const PROMPT_TEMPLATE_VERSION = "p0-scripted-1";
@@ -78,6 +103,24 @@ function effectiveBudget(task: Task, policy: Policy): Budget {
 
 // -------------------------------------------------------------------- runner
 
+/**
+ * Everything the memory-on path needs, injected so each piece can be swapped when its DEC lands: the store
+ * (DEC-08), embedder (DEC-10), reflector and judge (DEC-12) and the retention numbers (DEC-05). Pass a
+ * `FrozenMemoryRepository` for the frozen arm of an experiment.
+ */
+export interface MemoryRuntime {
+  repository: MemoryRepository;
+  records: RunRecords;
+  embedder: Embedder;
+  /** Null: no reflection, only the automatic episodic record. */
+  reflector: Reflector | null;
+  /** Null: the gate cannot judge, so non-episodic candidates go to review as `judge_unavailable`. */
+  judge: MemoryJudge | null;
+  retention?: RetentionConfig;
+  retrieval?: Partial<RetrievalConfig>;
+  gate?: Partial<GateConfig>;
+}
+
 export interface RunnerDeps {
   model: ModelAdapter;
   registry: ToolRegistry;
@@ -94,7 +137,15 @@ export interface RunnerDeps {
   /** Backoff sleep and jitter source, injectable so retries are deterministic in tests. */
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
+  /** Absent: memory is disabled whatever the policy says, and a policy that enables it is blocked. */
+  memory?: MemoryRuntime;
 }
+
+const PERSIST_ATTEMPTS = 3; // PRD §7.8: persistence retries 3 times
+
+/** `path:<workspace path>` preconditions hold while the file exists; any other precondition cannot be checked here and is assumed to hold. */
+const preconditionHolds = (workspace: Workspace) => (precondition: string): boolean =>
+  precondition.startsWith("path:") ? workspace.read(precondition.slice(5)) !== undefined : true;
 
 /** Control-flow signal: ends the run in a legal terminal state. */
 class Stop extends Error {
@@ -142,7 +193,8 @@ export class ReferenceRunner implements RunEngine {
       promptTemplateVersion: PROMPT_TEMPLATE_VERSION,
       toolRegistryVersion: registry.version,
       retrievalSnapshot: { mode: "disabled", indexVersion: null },
-      configArm: "A",
+      configArm: policy.memoryRules.retrievalEnabled && this.deps.memory ? "B" : "A",
+      ...(request.experiment ? { experimentId: request.experiment.experimentId, trialIndex: request.experiment.trialIndex } : {}),
       workspaceRef: workspace.ref,
       startWorkspaceHash: workspace.hash(),
       endWorkspaceHash: null,
@@ -252,21 +304,149 @@ export class ReferenceRunner implements RunEngine {
       throw new Stop("FAILED", "failed", "malformed_model_output", `${stage} output failed validation twice`);
     };
 
+    /** Reflection, gate and writeback for a verified run (PRD §7.6, §7.7, §12.2). */
+    const learn = async (memory: MemoryRuntime, evaluated: EvaluationResult): Promise<void> => {
+      const live = new LiveRecords(memory.records, {
+        task,
+        run,
+        events,
+        evaluation: evaluated,
+        append: (event) => {
+          const valid = EventSchema.parse(event);
+          events.push(valid);
+          sink?.append(valid);
+          run.timestamps.updatedAt = valid.timestamp;
+        },
+      });
+      const retention = memory.retention ?? PROPOSED_RETENTION;
+      const service = new MemoryService(memory.repository, live, clock, ids, retention);
+      const gate = new WriteGate({ records: live, repo: memory.repository, embedder: memory.embedder, judge: memory.judge, clock }, memory.gate);
+      const indexVersion = memory.retrieval?.indexVersion ?? "mem-index-1";
+      const writeback = new MemoryWriteback({ service, gate, embedder: memory.embedder, indexVersion, tenantId: task.tenantId });
+      const autoApprove = policy.memoryRules.autoApprove ?? ["episodic"];
+      const reflectorActor: Actor = { kind: "model", id: memory.reflector?.config.model ?? "reflector" };
+
+      let reflection: ReturnType<typeof parseReflection> | null = null;
+      if (memory.reflector) {
+        let validationError: string | undefined;
+        try {
+          for (let attempt = 1; attempt <= MAX_MODEL_ATTEMPTS; attempt++) {
+            const response = await memory.reflector.reflect({ task, run: structuredClone(run), evaluation: evaluated, events: structuredClone(events), validationError });
+            run.learningCost.reflectionTokens += response.usage.inputTokens + response.usage.outputTokens;
+            reflection = parseReflection(response.output, evaluated);
+            if (reflection.ok) break;
+            emit("model_output_invalid", reflectorActor, { stage: "reflection", attempt, issues: [reflection.issues] });
+            validationError = reflection.issues;
+          }
+        } catch (error) {
+          // PRD §7.8: with the reflector down the run outcome stands; only the automatic episodic record is written.
+          if (!(error instanceof ReflectorUnavailableError)) throw error;
+          emit("reflection_failed", reflectorActor, { cause: "unavailable", detail: error.message.slice(0, 200) });
+          reflection = null;
+        }
+        if (reflection && !reflection.ok) {
+          throw new Stop("FAILED", "failed", "malformed_model_output", "reflection output failed validation twice");
+        }
+      }
+
+      const candidates = [{ candidate: episodicCandidate({ task, run, evaluation: evaluated }), requiresReview: false }];
+      if (reflection?.ok) {
+        candidates.push({
+          candidate: reflectionCandidate(reflection.reflection, { task, run, evaluation: evaluated }),
+          requiresReview: reflection.reflection.requiresReview,
+        });
+        emit("reflection_recorded", reflectorActor, { reflection: redactReflection(reflection.reflection), candidates: candidates.length });
+      }
+
+      for (const { candidate, requiresReview } of candidates) {
+        let result: Awaited<ReturnType<MemoryWriteback["persist"]>> | null = null;
+        for (let attempt = 1; result === null; attempt++) {
+          try {
+            result = await writeback.persist(candidate, { autoApprove, requiresReview });
+          } catch (error) {
+            if (error instanceof FrozenMemoryError) {
+              emit("writeback_blocked", system, { reason: "repository_frozen" });
+              return;
+            }
+            if (!(error instanceof RepositoryUnavailableError)) throw error;
+            if (attempt >= PERSIST_ATTEMPTS) {
+              throw new Stop("INCONCLUSIVE", "inconclusive", "internal_error", `memory store unavailable during persistence after ${PERSIST_ATTEMPTS} attempts`);
+            }
+          }
+        }
+        run.learningCost.gateTokens += (result.judgeUsage?.inputTokens ?? 0) + (result.judgeUsage?.outputTokens ?? 0);
+        emit("gate_decision", system, { memoryId: result.memoryId, decision: result.decision });
+      }
+    };
+
     const drive = async (): Promise<void> => {
       moveTo("ADMITTED", "task admitted");
-      if (policy.memoryRules.retrievalEnabled || policy.memoryRules.writebackEnabled) {
+      const memory = this.deps.memory;
+      const retrievalOn = policy.memoryRules.retrievalEnabled;
+      const writebackOn = policy.memoryRules.writebackEnabled;
+      if ((retrievalOn || writebackOn) && !memory) {
         throw new Stop("BLOCKED", "blocked", "policy_denied", "policy enables memory but this runner is memory-disabled");
       }
 
       moveTo("RETRIEVING", "retrieval step");
-      emit("retrieval_skipped", system, { reason: "memory_disabled" });
+      let cards: MemoryCard[] = [];
+      let memoryBlock = "";
+      if (retrievalOn && memory) {
+        const retriever = new HybridRetriever(memory.repository, memory.records, memory.embedder, clock, memory.retrieval, memory.retention);
+        try {
+          const found = await retriever.retrieve(
+            {
+              tenantId: task.tenantId,
+              projectId: task.projectId,
+              text: [task.objective, task.taskClass].filter(Boolean).join(" "),
+              ...(task.taskClass ? { taskClass: task.taskClass } : {}),
+              preconditionHolds: preconditionHolds(workspace),
+            },
+            { maxCards: policy.memoryRules.maxCards, maxContextTokens: policy.memoryRules.maxContextTokens },
+          );
+          cards = found.cards;
+          memoryBlock = found.context;
+          run.retrievalSnapshot = {
+            mode: "hybrid",
+            indexVersion: found.indexVersion,
+            embeddingModel: found.embeddingModel,
+            embeddingVersion: found.embeddingVersion,
+          };
+          run.memoryContext = found.trace.map((t) => ({ memoryId: t.memoryId, version: t.version, rank: t.rank, score: t.score, injected: t.injected }));
+          emit("retrieval_recorded", system, {
+            indexVersion: found.indexVersion,
+            considered: found.considered,
+            excluded: found.excluded,
+            injected: found.cards.map((c) => ({ memoryId: c.memoryId, version: c.version, rank: c.rank, score: c.score })),
+            contextTokens: found.contextTokens,
+          });
+        } catch (error) {
+          // PRD §7.8: with the store or embedder down the run proceeds with no memory, tagged so experiments exclude it.
+          if (!(error instanceof RepositoryUnavailableError || error instanceof EmbedderUnavailableError)) throw error;
+          run.retrievalSnapshot = { mode: "degraded", indexVersion: null };
+          emit("retrieval_degraded", system, { reason: error.message.slice(0, 200) });
+        }
+      } else emit("retrieval_skipped", system, { reason: "memory_disabled" });
 
       moveTo("PLANNING", "planning");
       const plan: Plan = await callModel("plan", PlanSchema, (validationError) =>
-        model.plan({ objective: task.objective, mode: task.mode, authorizedTools: policy.toolAllowlist, validationError }),
+        model.plan({
+          objective: task.objective,
+          mode: task.mode,
+          authorizedTools: policy.toolAllowlist,
+          ...(cards.length > 0 ? { memory: { cards, context: memoryBlock } } : {}),
+          validationError,
+        }),
       );
-      if (plan.memoryIds.length > 0) {
-        throw new Stop("BLOCKED", "blocked", "policy_denied", "plan cites memory but memory is disabled (INV-02)");
+      // INV-02: a plan may cite only memory that was actually injected. Citing it grants nothing; tools are checked below regardless.
+      const injected = new Set(cards.map((c) => c.memoryId));
+      if (plan.memoryIds.some((id) => !injected.has(id))) {
+        throw new Stop(
+          "BLOCKED",
+          "blocked",
+          "policy_denied",
+          retrievalOn ? "plan cites memory that was not injected (INV-02)" : "plan cites memory but memory is disabled (INV-02)",
+        );
       }
       for (const tool of plan.tools) {
         const access = checkToolAccess(tool, { task, policy, registry });
@@ -277,6 +457,11 @@ export class ReferenceRunner implements RunEngine {
         }
       }
       emit("plan_recorded", modelActor, { plan });
+      // FR-27: every injected memory gets a use record. Whether it was followed and whether it helped is not knowable
+      // from one run; explicit feedback (`MemoryService.recordFeedback`) and paired evaluation answer that.
+      for (const card of cards) {
+        emit("memory_use", system, { memoryId: card.memoryId, citedInPlan: plan.memoryIds.includes(card.memoryId), followed: false, outcomeEffect: "unknown" });
+      }
 
       moveTo("EXECUTING", "executing plan");
       const observations: Observation[] = [];
@@ -337,7 +522,7 @@ export class ReferenceRunner implements RunEngine {
       }
 
       moveTo("EVALUATING", "execution ended");
-      evaluation = EvaluationSchema.parse(
+      const evaluated = EvaluationSchema.parse(
         evaluator.evaluate({
           evaluationId: ids.next("eval"),
           runId,
@@ -347,6 +532,7 @@ export class ReferenceRunner implements RunEngine {
           completedAt: clock.now(),
         }),
       );
+      evaluation = evaluated;
       emit("evaluation_recorded", { kind: "evaluator", id: evaluator.version }, { evaluationId: evaluation.id, verdict: evaluation.verdict });
       if (evaluation.outcomeReason === "evaluator_tamper_suspected") {
         emit(
@@ -364,7 +550,15 @@ export class ReferenceRunner implements RunEngine {
         throw new Stop("INCONCLUSIVE", "inconclusive", evaluation.outcomeReason, "evaluation could not decide");
       }
       moveTo("REFLECTING", "reflection step");
-      emit("reflection_skipped", system, { reason: "memory_disabled" });
+      if (!memory || !writebackOn) {
+        emit("reflection_skipped", system, { reason: retrievalOn ? "writeback_disabled" : "memory_disabled" });
+      } else if (task.split === "test") {
+        // FR-28, PRD §12.3: the held-out test split never writes. Refused here and, for a frozen repository, again below.
+        emit("writeback_blocked", system, { reason: "frozen_test_split" });
+        emit("reflection_skipped", system, { reason: "writeback_disabled" });
+      } else {
+        await learn(memory, evaluated);
+      }
       stop("COMPLETE", evaluation.verdict, evaluation.outcomeReason, "evaluation recorded");
     };
 
