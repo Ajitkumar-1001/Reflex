@@ -89,17 +89,26 @@ export interface StepInput {
   validationError?: string;
 }
 
-/** Provider seam (DEC-04). Throw `ModelUnavailableError` for provider outages. */
+/** Provider seam (DEC-10 pins the model, DEC-04 gates cloud use). Throw `ModelUnavailableError` for provider outages. */
 export interface ModelAdapter {
   readonly config: { provider: string; model: string; version: string };
   plan(input: PlanInput): Promise<ModelResponse>;
   nextStep(input: StepInput): Promise<ModelResponse>;
 }
 
+/** A retryable provider failure: 429, 5xx or a network error (PRD §7.8). */
 export class ModelUnavailableError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ModelUnavailableError";
+  }
+}
+
+/** The sandbox or its runtime is unavailable or crashed (PRD §7.8). Not retried in P0. */
+export class InfraFailureError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InfraFailureError";
   }
 }
 

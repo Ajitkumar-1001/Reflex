@@ -24,7 +24,7 @@ import type {
 import { admitTask } from "./admission";
 import { authorizeToolCall, checkToolAccess } from "./permission";
 import type { ToolRegistry } from "./permission";
-import { ModelUnavailableError } from "./ports";
+import { InfraFailureError, ModelUnavailableError } from "./ports";
 import type {
   ArtifactStore,
   Clock,
@@ -53,6 +53,21 @@ const PROMPT_TEMPLATE_VERSION = "p0-scripted-1";
 const MAX_DENIALS = 3;
 const MAX_MODEL_ATTEMPTS = 2;
 
+// PRD §7.8: provider failures retry 3 times at 2 s, 8 s, 30 s with jitter; a call over 120 s retries once.
+const PROVIDER_BACKOFF_MS = [2_000, 8_000, 30_000] as const;
+const MAX_TIMEOUT_RETRIES = 1;
+const DEFAULT_MODEL_TIMEOUT_MS = 120_000;
+const JITTER = 0.25; // ± fraction of the backoff; the PRD says "with jitter" without a width
+
+class TimedOut extends Error {}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new TimedOut()), ms);
+    promise.then(resolve, reject).finally(() => clearTimeout(timer));
+  });
+}
+
 function effectiveBudget(task: Task, policy: Policy): Budget {
   return {
     maxSteps: Math.min(task.budget.maxSteps, policy.budgets.maxSteps),
@@ -74,6 +89,11 @@ export interface RunnerDeps {
   clock: Clock;
   ids: IdGenerator;
   sink?: EventSink;
+  /** Per-call model timeout; PRD §7.8 default 120 s. */
+  modelTimeoutMs?: number;
+  /** Backoff sleep and jitter source, injectable so retries are deterministic in tests. */
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
 }
 
 /** Control-flow signal: ends the run in a legal terminal state. */
@@ -96,6 +116,9 @@ export class ReferenceRunner implements RunEngine {
 
   async execute(request: RunRequest): Promise<RunResult> {
     const { model, registry, evaluator, workspace, commands, artifacts, clock, ids, sink } = this.deps;
+    const modelTimeoutMs = this.deps.modelTimeoutMs ?? DEFAULT_MODEL_TIMEOUT_MS;
+    const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const random = this.deps.random ?? Math.random;
     const admission = admitTask(request.task, request.policy, registry);
     if (!admission.ok) return { admitted: false, issues: admission.issues };
     const { task, policy } = admission;
@@ -179,6 +202,32 @@ export class ReferenceRunner implements RunEngine {
       if (run.cost.wallMs > budget.maxWallMinutes * 60_000) throw new Stop("FAILED", "failed", "budget_exhausted", "wall-clock budget exhausted");
     };
 
+    /** One model call with the §7.8 provider and timeout retries; each retry is budget-checked and traced. */
+    const invoke = async (stage: "plan" | "step", call: () => Promise<ModelResponse>): Promise<ModelResponse> => {
+      let providerRetries = 0;
+      let timeoutRetries = 0;
+      for (;;) {
+        checkLimits();
+        try {
+          return await withTimeout(call(), modelTimeoutMs);
+        } catch (error) {
+          if (error instanceof TimedOut) {
+            if (timeoutRetries >= MAX_TIMEOUT_RETRIES) {
+              throw new Stop("INCONCLUSIVE", "inconclusive", "model_unavailable", `${stage} call timed out after ${modelTimeoutMs} ms, twice`);
+            }
+            emit("model_retry", modelActor, { stage, cause: "timeout", retry: ++timeoutRetries, delayMs: 0 });
+          } else if (error instanceof ModelUnavailableError) {
+            if (providerRetries >= PROVIDER_BACKOFF_MS.length) {
+              throw new Stop("INCONCLUSIVE", "inconclusive", "model_unavailable", `provider failed ${providerRetries + 1} times: ${error.message}`);
+            }
+            const delayMs = Math.round(PROVIDER_BACKOFF_MS[providerRetries] * (1 - JITTER + 2 * JITTER * random()));
+            emit("model_retry", modelActor, { stage, cause: "provider_error", retry: ++providerRetries, delayMs });
+            await sleep(delayMs);
+          } else throw error;
+        }
+      }
+    };
+
     /** Calls the model, validates its output at the boundary, and re-prompts once with the validation error. */
     const callModel = async <S extends z.ZodType>(
       stage: "plan" | "step",
@@ -187,8 +236,7 @@ export class ReferenceRunner implements RunEngine {
     ): Promise<z.output<S>> => {
       let validationError: string | undefined;
       for (let attempt = 1; attempt <= MAX_MODEL_ATTEMPTS; attempt++) {
-        checkLimits();
-        const response = await call(validationError);
+        const response = await invoke(stage, () => call(validationError));
         run.cost.inputTokens += response.usage.inputTokens;
         run.cost.outputTokens += response.usage.outputTokens;
         run.cost.usd += response.usage.usd;
@@ -257,10 +305,20 @@ export class ReferenceRunner implements RunEngine {
         emit("tool_authorized", modelActor, { callId, tool: name, argsSummary: JSON.stringify(call.args).slice(0, 200) });
         const startedMs = clock.now().getTime();
         let output: ToolOutput;
+        let infraFailure: InfraFailureError | null = null;
         try {
-          output = await decision.tool.execute(decision.args, { workspace, scope: task.scope, commands, artifacts });
+          output = await withTimeout(
+            decision.tool.execute(decision.args, { workspace, scope: task.scope, commands, artifacts }),
+            decision.tool.descriptor.timeoutMs,
+          );
         } catch (error) {
-          output = { ok: false, summary: "tool raised an error", observation: error instanceof Error ? error.message : "tool error" };
+          if (error instanceof InfraFailureError) infraFailure = error;
+          output =
+            error instanceof InfraFailureError
+              ? { ok: false, summary: "sandbox unavailable", observation: error.message }
+              : error instanceof TimedOut
+              ? { ok: false, summary: "tool timed out", observation: `${name} timed out after ${decision.tool.descriptor.timeoutMs} ms` }
+              : { ok: false, summary: "tool raised an error", observation: error instanceof Error ? error.message : "tool error" };
         }
         const durationMs = Math.max(0, clock.now().getTime() - startedMs);
         const key = decision.tool.descriptor.sideEffect === "read_only" ? undefined : `${runId}:${callId}`;
@@ -270,6 +328,7 @@ export class ReferenceRunner implements RunEngine {
           { callId, tool: name, ok: output.ok, summary: output.summary, durationMs, ...(output.exitStatus !== undefined ? { exitStatus: output.exitStatus } : {}) },
           { ...(key ? { idempotencyKey: key } : {}), ...(output.artifactRef ? { artifactRef: output.artifactRef } : {}) },
         );
+        if (infraFailure) throw new Stop("INCONCLUSIVE", "inconclusive", "infra_failure", infraFailure.message);
         observations.push({ callId, tool: name, ok: output.ok, text: output.observation });
         finished = decision.tool.descriptor.endsExecution;
       }
@@ -312,7 +371,6 @@ export class ReferenceRunner implements RunEngine {
     } catch (error) {
       if (isTerminal(run.status)) throw error;
       if (error instanceof Stop) stop(error.state, error.outcome, error.reason, error.detail);
-      else if (error instanceof ModelUnavailableError) stop("INCONCLUSIVE", "inconclusive", "model_unavailable", error.message);
       else stop("FAILED", "failed", "internal_error", error instanceof Error ? error.message : "unknown error");
     }
 

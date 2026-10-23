@@ -440,6 +440,15 @@ export const EventSchema = z.discriminatedUnion("type", [
     }),
   ),
   eventVariant(
+    "model_retry",
+    z.strictObject({
+      stage: z.enum(["plan", "step"]),
+      cause: z.enum(["provider_error", "timeout"]),
+      retry: z.int().positive(),
+      delayMs: z.int().nonnegative(),
+    }),
+  ),
+  eventVariant(
     "model_output_invalid",
     z.strictObject({ stage: z.enum(["plan", "step"]), attempt: z.int().positive(), issues: z.array(z.string()) }),
   ),

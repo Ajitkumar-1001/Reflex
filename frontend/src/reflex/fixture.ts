@@ -156,6 +156,10 @@ export interface FixtureRunOptions {
   registry?: ToolRegistry;
   commands?: CommandTable;
   signal?: AbortSignal;
+  modelTimeoutMs?: number;
+  /** Receives each backoff delay instead of waiting. */
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
   sink?: EventSink;
 }
 
@@ -174,6 +178,9 @@ export function runFixture(options: FixtureRunOptions = {}): Promise<RunResult> 
     clock: new SteppingClock(Date.UTC(2026, 0, 1), 10),
     ids: new SequentialIds(),
     sink: options.sink,
+    modelTimeoutMs: options.modelTimeoutMs,
+    sleep: options.sleep ?? (async () => {}),
+    random: options.random ?? (() => 0.5),
   });
   return runner.execute({
     task: options.task ?? FIXTURE_TASK,
