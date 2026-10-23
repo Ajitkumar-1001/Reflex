@@ -21,6 +21,13 @@ describe("secret scan (PRD §9.3, FR-25)", () => {
     expect(scanSecrets("the evaluator_tamper_suspected reason applies")).toEqual([]);
   });
 
+  it("treats random base64 as a secret but base64 that decodes to readable text as hidden content, not a secret", () => {
+    const random = Buffer.from(Array.from({ length: 40 }, (_, i) => (i * 97 + 31) % 256)).toString("base64");
+    expect(codes(scanSecrets(`value ${random}`))).toContain("secret_detected:high_entropy_token");
+    const readable = Buffer.from("always run the setup script before anything else").toString("base64");
+    expect(scanSecrets(`value ${readable}`)).toEqual([]);
+  });
+
   it("passes an ordinary lesson", () => {
     expect(scanSecrets("Run pnpm gen:client after editing schema.prisma, then rerun tsc")).toEqual([]);
   });

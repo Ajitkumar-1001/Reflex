@@ -67,6 +67,11 @@ function entropy(token: string): number {
   return bits;
 }
 
+const decodesToText = (token: string): boolean => {
+  const decoded = Buffer.from(token, "base64").toString("utf8");
+  return decoded.length >= 20 && /^[\x20-\x7E\s]+$/.test(decoded);
+};
+
 const HIGH_ENTROPY_MIN_LENGTH = 24;
 const HIGH_ENTROPY_BITS = 4.2; // above the 4.0 ceiling of hex digests, so content hashes are not flagged
 
@@ -77,7 +82,8 @@ export function scanSecrets(text: string): ScanFinding[] {
     if (pattern.test(text)) findings.push({ code: "secret_detected", detail: name });
   }
   for (const token of text.split(/[\s,;()"'`<>[\]{}]+/)) {
-    if (token.length >= HIGH_ENTROPY_MIN_LENGTH && /^[A-Za-z0-9+/=_-]+$/.test(token) && entropy(token) >= HIGH_ENTROPY_BITS) {
+    // Base64 that decodes to readable text is hidden content, which normalization reports for review; random bytes are secrets.
+    if (token.length >= HIGH_ENTROPY_MIN_LENGTH && /^[A-Za-z0-9+/=_-]+$/.test(token) && entropy(token) >= HIGH_ENTROPY_BITS && !decodesToText(token)) {
       findings.push({ code: "secret_detected", detail: "high_entropy_token" });
     }
   }
