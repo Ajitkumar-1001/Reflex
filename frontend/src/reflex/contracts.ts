@@ -55,6 +55,7 @@ export const RunState = z.enum([
   "RETRIEVING",
   "PLANNING",
   "EXECUTING",
+  "AWAITING_APPROVAL",
   "EVALUATING",
   "REFLECTING",
   "COMPLETE",
@@ -78,14 +79,18 @@ export function isTerminal(state: RunState): state is TerminalState {
  * BLOCKED and INCONCLUSIVE are also reachable from PLANNING and EXECUTING, because §7.8 (3 policy
  * denials -> BLOCKED/policy_denied; provider or sandbox failure -> INCONCLUSIVE) and §11 (a plan that
  * needs an external write -> BLOCKED/approval_required_p0) require it and §7.1's literal list does not
- * cover them. REFLECTING -> INCONCLUSIVE likewise carries §7.8's "Atlas unavailable during persistence". WAITING_APPROVAL and RETRY_PENDING are P1 and intentionally absent.
+ * cover them. REFLECTING -> INCONCLUSIVE likewise carries §7.8's "Atlas unavailable during persistence".
+ * AWAITING_APPROVAL is the Phase 2 pause (awaiting_approval): execution stops until an authorized
+ * approval. Resume is EXECUTING; deny and expiry go to BLOCKED. RETRY_PENDING stays absent; the queue
+ * workstream owns it.
  */
 export const TRANSITIONS: Record<RunState, readonly RunState[]> = {
   CREATED: ["ADMITTED", "CANCELLED", "FAILED"],
   ADMITTED: ["RETRIEVING", "BLOCKED", "CANCELLED", "FAILED"],
   RETRIEVING: ["PLANNING", "CANCELLED", "FAILED"],
   PLANNING: ["EXECUTING", "BLOCKED", "INCONCLUSIVE", "CANCELLED", "FAILED"],
-  EXECUTING: ["EVALUATING", "BLOCKED", "INCONCLUSIVE", "CANCELLED", "FAILED"],
+  EXECUTING: ["EVALUATING", "AWAITING_APPROVAL", "BLOCKED", "INCONCLUSIVE", "CANCELLED", "FAILED"],
+  AWAITING_APPROVAL: ["EXECUTING", "BLOCKED", "CANCELLED", "FAILED"],
   EVALUATING: ["REFLECTING", "INCONCLUSIVE", "CANCELLED", "FAILED"],
   REFLECTING: ["COMPLETE", "INCONCLUSIVE", "CANCELLED", "FAILED"],
   COMPLETE: [],
@@ -117,6 +122,8 @@ export const OutcomeReason = z.enum([
   "policy_denied",
   "cloud_not_permitted",
   "approval_required_p0",
+  "approval_denied",
+  "approval_expired",
   "user_cancel",
   "shutdown",
 ]);
@@ -140,7 +147,7 @@ export const TERMINAL_RESULTS: readonly {
     outcome: "failed",
     reasons: ["budget_exhausted", "step_limit", "malformed_model_output", "internal_error"],
   },
-  { state: "BLOCKED", outcome: "blocked", reasons: ["policy_denied", "cloud_not_permitted", "approval_required_p0"] },
+  { state: "BLOCKED", outcome: "blocked", reasons: ["policy_denied", "cloud_not_permitted", "approval_required_p0", "approval_denied", "approval_expired"] },
   { state: "CANCELLED", outcome: "cancelled", reasons: ["user_cancel", "shutdown"] },
 ];
 
