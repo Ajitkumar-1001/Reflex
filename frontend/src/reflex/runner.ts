@@ -2,9 +2,7 @@ import {
   EvaluationSchema,
   EventSchema,
   PlanSchema,
-  PolicySchema,
   RunSchema,
-  TaskSchema,
   ToolCallRequest,
   assertTransition,
   isTerminal,
@@ -23,13 +21,14 @@ import type {
   Task,
   TerminalState,
 } from "./contracts";
+import { admitTask } from "./admission";
 import { authorizeToolCall, checkToolAccess } from "./permission";
 import type { ToolRegistry } from "./permission";
-import { ModelUnavailableError } from "./ports";
+import { InfraFailureError, ModelUnavailableError } from "./ports";
 import type {
-  AdmissionIssue,
-  CheckSet,
+  ArtifactStore,
   Clock,
+  CommandTable,
   EventSink,
   Evaluator,
   IdGenerator,
@@ -53,46 +52,27 @@ import type { z } from "zod";
 const PROMPT_TEMPLATE_VERSION = "p0-scripted-1";
 const MAX_DENIALS = 3;
 const MAX_MODEL_ATTEMPTS = 2;
-const RISK_RANK = { low: 0, medium: 1, high: 2 } as const;
 
-// ----------------------------------------------------------------- admission
+// PRD §7.8: provider failures retry 3 times at 2 s, 8 s, 30 s with jitter; a call over 120 s retries once.
+const PROVIDER_BACKOFF_MS = [2_000, 8_000, 30_000] as const;
+const MAX_TIMEOUT_RETRIES = 1;
+const DEFAULT_MODEL_TIMEOUT_MS = 120_000;
+const JITTER = 0.25; // ± fraction of the backoff; the PRD says "with jitter" without a width
 
-export type Admission = { ok: true; task: Task; policy: Policy } | { ok: false; issues: AdmissionIssue[] };
+class TimedOut extends Error {}
 
-/** FR-01: typed admission. Anything unknown, unregistered or over-privileged is rejected (INV-08). */
-export function admitTask(taskInput: unknown, policyInput: unknown, registry: ToolRegistry): Admission {
-  const issues: AdmissionIssue[] = [];
-  const task = TaskSchema.safeParse(taskInput);
-  const policy = PolicySchema.safeParse(policyInput);
-  if (!task.success) {
-    issues.push(...task.error.issues.map((i) => ({ code: "invalid_task", message: `${i.path.join(".") || "task"}: ${i.message}` })));
-  }
-  if (!policy.success) {
-    issues.push(...policy.error.issues.map((i) => ({ code: "invalid_policy", message: `${i.path.join(".") || "policy"}: ${i.message}` })));
-  }
-  if (!task.success || !policy.success) return { ok: false, issues };
-
-  const t = task.data;
-  const p = policy.data;
-  if (t.policy.id !== p.id || t.policy.version !== p.version) {
-    issues.push({ code: "policy_mismatch", message: `task pins ${t.policy.id}@${t.policy.version}, got ${p.id}@${p.version}` });
-  }
-  if (p.status !== "ACTIVE") issues.push({ code: "policy_not_active", message: `policy status is ${p.status}` });
-  if (RISK_RANK[t.riskClass] > RISK_RANK[p.riskClass]) {
-    issues.push({ code: "risk_exceeds_policy", message: `task risk ${t.riskClass} exceeds policy risk ${p.riskClass}` });
-  }
-  for (const tool of t.authorizedTools) {
-    const access = checkToolAccess(tool, { task: t, policy: p, registry });
-    if ("denial" in access) issues.push({ code: access.denial.reasonCode, message: access.denial.detail });
-  }
-  return issues.length > 0 ? { ok: false, issues } : { ok: true, task: t, policy: p };
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new TimedOut()), ms);
+    promise.then(resolve, reject).finally(() => clearTimeout(timer));
+  });
 }
 
 function effectiveBudget(task: Task, policy: Policy): Budget {
   return {
     maxSteps: Math.min(task.budget.maxSteps, policy.budgets.maxSteps),
-    maxWallMs: Math.min(task.budget.maxWallMs, policy.budgets.maxWallMs),
     maxUsd: Math.min(task.budget.maxUsd, policy.budgets.maxUsd),
+    maxWallMinutes: Math.min(task.budget.maxWallMinutes, policy.budgets.maxWallMinutes),
   };
 }
 
@@ -104,10 +84,16 @@ export interface RunnerDeps {
   evaluator: Evaluator;
   /** Fresh per run: the runner mutates it through tools. */
   workspace: Workspace;
-  checks: CheckSet;
+  commands: CommandTable;
+  artifacts: ArtifactStore;
   clock: Clock;
   ids: IdGenerator;
   sink?: EventSink;
+  /** Per-call model timeout; PRD §7.8 default 120 s. */
+  modelTimeoutMs?: number;
+  /** Backoff sleep and jitter source, injectable so retries are deterministic in tests. */
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
 }
 
 /** Control-flow signal: ends the run in a legal terminal state. */
@@ -129,7 +115,10 @@ export class ReferenceRunner implements RunEngine {
   constructor(private readonly deps: RunnerDeps) {}
 
   async execute(request: RunRequest): Promise<RunResult> {
-    const { model, registry, evaluator, workspace, checks, clock, ids, sink } = this.deps;
+    const { model, registry, evaluator, workspace, commands, artifacts, clock, ids, sink } = this.deps;
+    const modelTimeoutMs = this.deps.modelTimeoutMs ?? DEFAULT_MODEL_TIMEOUT_MS;
+    const sleep = this.deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+    const random = this.deps.random ?? Math.random;
     const admission = admitTask(request.task, request.policy, registry);
     if (!admission.ok) return { admitted: false, issues: admission.issues };
     const { task, policy } = admission;
@@ -140,13 +129,15 @@ export class ReferenceRunner implements RunEngine {
     const system: Actor = { kind: "system", id: "reference-runner" };
     const modelActor: Actor = { kind: "model", id: model.config.model };
     const createdAt = clock.now();
+    const before = workspace.snapshot();
     let evaluation: EvaluationResult | null = null;
 
     const run: Run = {
       id: runId,
       taskId: task.id,
       status: "CREATED",
-      policy: task.policy,
+      policyId: task.policyId,
+      policyVersion: task.policyVersion,
       modelConfig: model.config,
       promptTemplateVersion: PROMPT_TEMPLATE_VERSION,
       toolRegistryVersion: registry.version,
@@ -156,7 +147,12 @@ export class ReferenceRunner implements RunEngine {
       startWorkspaceHash: workspace.hash(),
       endWorkspaceHash: null,
       budget,
-      ledger: { steps: 0, usd: 0, wallMs: 0 },
+      steps: 0,
+      cost: { inputTokens: 0, outputTokens: 0, usd: 0, wallMs: 0 },
+      learningCost: { reflectionTokens: 0, gateTokens: 0 },
+      playbookVersion: null,
+      memoryContext: [],
+      evalSplit: task.split ?? "none",
       timestamps: { createdAt: createdAt.toISOString(), updatedAt: createdAt.toISOString(), endedAt: null },
       outcome: null,
       outcomeReason: null,
@@ -166,7 +162,7 @@ export class ReferenceRunner implements RunEngine {
       type: T,
       actor: Actor,
       payload: EventOf<T>["redactedPayload"],
-      idempotencyKey?: string,
+      extra: { idempotencyKey?: string; artifactRef?: string } = {},
     ): RunEvent => {
       const event = EventSchema.parse({
         id: ids.next("evt"),
@@ -176,7 +172,7 @@ export class ReferenceRunner implements RunEngine {
         timestamp: clock.now().toISOString(),
         type,
         redactedPayload: payload,
-        ...(idempotencyKey ? { idempotencyKey } : {}),
+        ...extra,
       });
       events.push(event);
       sink?.append(event);
@@ -199,11 +195,40 @@ export class ReferenceRunner implements RunEngine {
     };
 
     const checkLimits = (): void => {
-      run.ledger.wallMs = Math.max(0, clock.now().getTime() - createdAt.getTime());
-      if (request.signal?.aborted) throw new Stop("CANCELLED", "cancelled", "user_cancel", "cancellation requested");
-      if (run.ledger.steps >= budget.maxSteps) throw new Stop("FAILED", "failed", "step_limit", `step limit ${budget.maxSteps} reached`);
-      if (run.ledger.usd > budget.maxUsd) throw new Stop("FAILED", "failed", "budget_exhausted", "cost budget exhausted");
-      if (run.ledger.wallMs > budget.maxWallMs) throw new Stop("FAILED", "failed", "budget_exhausted", "wall-clock budget exhausted");
+      run.cost.wallMs = Math.max(0, clock.now().getTime() - createdAt.getTime());
+      if (request.signal?.aborted) {
+        const shutdown = request.signal.reason === "shutdown";
+        throw new Stop("CANCELLED", "cancelled", shutdown ? "shutdown" : "user_cancel", shutdown ? "process shutting down" : "cancellation requested");
+      }
+      if (run.steps >= budget.maxSteps) throw new Stop("FAILED", "failed", "step_limit", `step limit ${budget.maxSteps} reached`);
+      if (run.cost.usd > budget.maxUsd) throw new Stop("FAILED", "failed", "budget_exhausted", "cost budget exhausted");
+      if (run.cost.wallMs > budget.maxWallMinutes * 60_000) throw new Stop("FAILED", "failed", "budget_exhausted", "wall-clock budget exhausted");
+    };
+
+    /** One model call with the §7.8 provider and timeout retries; each retry is budget-checked and traced. */
+    const invoke = async (stage: "plan" | "step", call: () => Promise<ModelResponse>): Promise<ModelResponse> => {
+      let providerRetries = 0;
+      let timeoutRetries = 0;
+      for (;;) {
+        checkLimits();
+        try {
+          return await withTimeout(call(), modelTimeoutMs);
+        } catch (error) {
+          if (error instanceof TimedOut) {
+            if (timeoutRetries >= MAX_TIMEOUT_RETRIES) {
+              throw new Stop("INCONCLUSIVE", "inconclusive", "model_unavailable", `${stage} call timed out after ${modelTimeoutMs} ms, twice`);
+            }
+            emit("model_retry", modelActor, { stage, cause: "timeout", retry: ++timeoutRetries, delayMs: 0 });
+          } else if (error instanceof ModelUnavailableError) {
+            if (providerRetries >= PROVIDER_BACKOFF_MS.length) {
+              throw new Stop("INCONCLUSIVE", "inconclusive", "model_unavailable", `provider failed ${providerRetries + 1} times: ${error.message}`);
+            }
+            const delayMs = Math.round(PROVIDER_BACKOFF_MS[providerRetries] * (1 - JITTER + 2 * JITTER * random()));
+            emit("model_retry", modelActor, { stage, cause: "provider_error", retry: ++providerRetries, delayMs });
+            await sleep(delayMs);
+          } else throw error;
+        }
+      }
     };
 
     /** Calls the model, validates its output at the boundary, and re-prompts once with the validation error. */
@@ -214,9 +239,10 @@ export class ReferenceRunner implements RunEngine {
     ): Promise<z.output<S>> => {
       let validationError: string | undefined;
       for (let attempt = 1; attempt <= MAX_MODEL_ATTEMPTS; attempt++) {
-        checkLimits();
-        const response = await call(validationError);
-        run.ledger.usd += response.usage.usd;
+        const response = await invoke(stage, () => call(validationError));
+        run.cost.inputTokens += response.usage.inputTokens;
+        run.cost.outputTokens += response.usage.outputTokens;
+        run.cost.usd += response.usage.usd;
         const parsed = schema.safeParse(response.output);
         if (parsed.success) return parsed.data;
         const issues = parsed.error.issues.map((i) => `${i.path.join(".") || "output"}: ${i.message}`).slice(0, 5);
@@ -237,7 +263,7 @@ export class ReferenceRunner implements RunEngine {
 
       moveTo("PLANNING", "planning");
       const plan: Plan = await callModel("plan", PlanSchema, (validationError) =>
-        model.plan({ objective: task.objective, mode: task.mode, authorizedTools: task.authorizedTools, validationError }),
+        model.plan({ objective: task.objective, mode: task.mode, authorizedTools: policy.toolAllowlist, validationError }),
       );
       if (plan.memoryIds.length > 0) {
         throw new Stop("BLOCKED", "blocked", "policy_denied", "plan cites memory but memory is disabled (INV-02)");
@@ -258,9 +284,9 @@ export class ReferenceRunner implements RunEngine {
       for (let finished = false; !finished; ) {
         checkLimits();
         const call = await callModel("step", ToolCallRequest, (validationError) =>
-          model.nextStep({ step: run.ledger.steps + 1, plan, observations, validationError }),
+          model.nextStep({ step: run.steps + 1, plan, observations, validationError }),
         );
-        run.ledger.steps++;
+        run.steps++;
         const callId = ids.next("call");
         const decision = authorizeToolCall(call, { task, policy, registry });
 
@@ -282,14 +308,30 @@ export class ReferenceRunner implements RunEngine {
         emit("tool_authorized", modelActor, { callId, tool: name, argsSummary: JSON.stringify(call.args).slice(0, 200) });
         const startedMs = clock.now().getTime();
         let output: ToolOutput;
+        let infraFailure: InfraFailureError | null = null;
         try {
-          output = await decision.tool.execute(decision.args, { workspace, checks });
+          output = await withTimeout(
+            decision.tool.execute(decision.args, { workspace, scope: task.scope, commands, artifacts }),
+            decision.tool.descriptor.timeoutMs,
+          );
         } catch (error) {
-          output = { ok: false, summary: "tool raised an error", observation: error instanceof Error ? error.message : "tool error" };
+          if (error instanceof InfraFailureError) infraFailure = error;
+          output =
+            error instanceof InfraFailureError
+              ? { ok: false, summary: "sandbox unavailable", observation: error.message }
+              : error instanceof TimedOut
+              ? { ok: false, summary: "tool timed out", observation: `${name} timed out after ${decision.tool.descriptor.timeoutMs} ms` }
+              : { ok: false, summary: "tool raised an error", observation: error instanceof Error ? error.message : "tool error" };
         }
         const durationMs = Math.max(0, clock.now().getTime() - startedMs);
         const key = decision.tool.descriptor.sideEffect === "read_only" ? undefined : `${runId}:${callId}`;
-        emit("tool_result", { kind: "tool", id: name }, { callId, tool: name, ok: output.ok, summary: output.summary, durationMs }, key);
+        emit(
+          "tool_result",
+          { kind: "tool", id: name },
+          { callId, tool: name, ok: output.ok, summary: output.summary, durationMs, ...(output.exitStatus !== undefined ? { exitStatus: output.exitStatus } : {}) },
+          { ...(key ? { idempotencyKey: key } : {}), ...(output.artifactRef ? { artifactRef: output.artifactRef } : {}) },
+        );
+        if (infraFailure) throw new Stop("INCONCLUSIVE", "inconclusive", "infra_failure", infraFailure.message);
         observations.push({ callId, tool: name, ok: output.ok, text: output.observation });
         finished = decision.tool.descriptor.endsExecution;
       }
@@ -301,10 +343,22 @@ export class ReferenceRunner implements RunEngine {
           runId,
           task,
           workspace,
+          before,
           completedAt: clock.now(),
         }),
       );
       emit("evaluation_recorded", { kind: "evaluator", id: evaluator.version }, { evaluationId: evaluation.id, verdict: evaluation.verdict });
+      if (evaluation.outcomeReason === "evaluator_tamper_suspected") {
+        emit(
+          "evaluator_tamper_flag",
+          { kind: "evaluator", id: evaluator.version },
+          {
+            evaluationId: evaluation.id,
+            touchedProtectedPaths: evaluation.touchedProtectedPaths,
+            signals: evaluation.evidenceRefs.filter((ref) => ref.startsWith("tamper:")),
+          },
+        );
+      }
 
       if (evaluation.verdict === "inconclusive") {
         throw new Stop("INCONCLUSIVE", "inconclusive", evaluation.outcomeReason, "evaluation could not decide");
@@ -320,7 +374,6 @@ export class ReferenceRunner implements RunEngine {
     } catch (error) {
       if (isTerminal(run.status)) throw error;
       if (error instanceof Stop) stop(error.state, error.outcome, error.reason, error.detail);
-      else if (error instanceof ModelUnavailableError) stop("INCONCLUSIVE", "inconclusive", "model_unavailable", error.message);
       else stop("FAILED", "failed", "internal_error", error instanceof Error ? error.message : "unknown error");
     }
 

@@ -1,11 +1,14 @@
 import type { z } from "zod";
 import type {
+  DenialReason,
   EvaluationResult,
   Plan,
+  Policy,
   Run,
   RunEvent,
   SideEffectClass,
   Task,
+  TaskScope,
 } from "./contracts";
 
 /*
@@ -28,12 +31,28 @@ export interface Workspace {
   read(path: string): string | undefined;
   write(path: string, content: string): void;
   hash(): string;
+  /** Every file by path, for diffing the start and end states of a run. */
+  snapshot(): Readonly<Record<string, string>>;
+  /** An independent copy, so a check can run against the final state without being able to change it. */
+  clone(): Workspace;
 }
 
-export type WorkspaceReader = Pick<Workspace, "list" | "read">;
+export interface CommandResult {
+  exitCode: number;
+  output: string;
+}
 
-/** A deterministic check over the final workspace. `checkId` in a task's `doneWhen` resolves here. */
-export type CheckSet = Readonly<Record<string, (workspace: WorkspaceReader) => boolean>>;
+/**
+ * Stand-in for a sandboxed process (DEC-02), keyed by the space-joined argv. `run_command` and the
+ * task's `doneWhen` checks both resolve through it; a handler may mutate the workspace it is given.
+ */
+export type CommandTable = Readonly<Record<string, (workspace: Workspace) => CommandResult>>;
+
+/** Large tool output is stored by content hash and referenced from the event (PRD §10, §11). Retention is DEC-05. */
+export interface ArtifactStore {
+  /** Returns the `sha256:<hex>` reference. */
+  put(content: string): string;
+}
 
 // ------------------------------------------------------------------- model
 
@@ -70,17 +89,26 @@ export interface StepInput {
   validationError?: string;
 }
 
-/** Provider seam (DEC-04). Throw `ModelUnavailableError` for provider outages. */
+/** Provider seam (DEC-10 pins the model, DEC-04 gates cloud use). Throw `ModelUnavailableError` for provider outages. */
 export interface ModelAdapter {
   readonly config: { provider: string; model: string; version: string };
   plan(input: PlanInput): Promise<ModelResponse>;
   nextStep(input: StepInput): Promise<ModelResponse>;
 }
 
+/** A retryable provider failure: 429, 5xx or a network error (PRD §7.8). */
 export class ModelUnavailableError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ModelUnavailableError";
+  }
+}
+
+/** The sandbox or its runtime is unavailable or crashed (PRD §7.8). Not retried in P0. */
+export class InfraFailureError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InfraFailureError";
   }
 }
 
@@ -96,13 +124,20 @@ export interface ToolDescriptor {
   readonly timeoutMs: number;
   readonly idempotent: boolean;
   readonly endsExecution: boolean;
+  readonly outputSchema: z.ZodType<ToolOutput>;
   /** Workspace paths the call would touch, from already-validated arguments. */
   touchedPaths(args: unknown): string[];
+  /** Argument-dependent policy check that the input schema cannot express, e.g. the command allowlist. */
+  denyArgs?(args: unknown, policy: Policy): Denial | null;
 }
+
+export type Denial = { reasonCode: DenialReason; detail: string };
 
 export interface ToolContext {
   workspace: Workspace;
-  checks: CheckSet;
+  scope: TaskScope;
+  commands: CommandTable;
+  artifacts: ArtifactStore;
 }
 
 /** `summary` is persisted in the trace; `observation` goes back to the model and is untrusted data. */
@@ -110,6 +145,8 @@ export interface ToolOutput {
   ok: boolean;
   summary: string;
   observation: string;
+  exitStatus?: number;
+  artifactRef?: string;
 }
 
 export interface ToolAdapter {
@@ -119,9 +156,27 @@ export interface ToolAdapter {
 
 // -------------------------------------------------------------- evaluation
 
+/**
+ * Checks the agent never sees (PRD §12.1), resolved by the task's `hiddenCheckBundleRef`. The bundle
+ * lives with the evaluator, not in the worktree, so the agent cannot read or edit it.
+ */
+export interface HiddenCheckBundle {
+  checks: readonly { name: string; command: string }[];
+  commands: CommandTable;
+}
+
 export interface Evaluator {
   readonly version: string;
-  evaluate(input: { evaluationId: string; runId: string; task: Task; workspace: WorkspaceReader; completedAt: Date }): EvaluationResult;
+  evaluate(input: {
+    evaluationId: string;
+    runId: string;
+    task: Task;
+    /** The workspace as the run left it; the evaluator only runs checks against copies. */
+    workspace: Workspace;
+    /** The workspace as the run found it, to detect changes to protected paths. */
+    before: Readonly<Record<string, string>>;
+    completedAt: Date;
+  }): EvaluationResult;
 }
 
 // ------------------------------------------------------------ trace and run
@@ -131,8 +186,10 @@ export interface EventSink {
   append(event: RunEvent): void;
 }
 
+/** `code` follows the PRD §15.1 error taxonomy; `reason` is the specific rule that failed. */
 export interface AdmissionIssue {
-  code: string;
+  code: "validation_error" | "forbidden_field" | "policy_violation";
+  reason: string;
   message: string;
 }
 

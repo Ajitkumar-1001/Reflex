@@ -1,9 +1,11 @@
-import { InMemoryWorkspace, ScriptedModel, SequentialIds, SteppingClock, createStubTools } from "./adapters";
+import { InMemoryArtifactStore, InMemoryWorkspace, ScriptedModel, SequentialIds, SteppingClock, createStubTools } from "./adapters";
 import type { ModelScript } from "./adapters";
 import { CheckEvaluator } from "./evaluator";
 import { ToolRegistry } from "./permission";
-import type { Plan, Policy, Task } from "./contracts";
-import type { CheckSet, EventSink, ModelAdapter, RunResult } from "./ports";
+import { createTask } from "./admission";
+import { DEFAULT_COMMAND_ALLOWLIST } from "./contracts";
+import type { CreateTask, Plan, Policy, Task } from "./contracts";
+import type { CommandTable, EventSink, HiddenCheckBundle, ModelAdapter, RunResult } from "./ports";
 import { ReferenceRunner } from "./runner";
 
 /*
@@ -18,9 +20,27 @@ export const FIXTURE_FILES: Readonly<Record<string, string>> = {
 
 export const FIXED_ADD_SOURCE = "export const add = (a: number, b: number): number => a + b;\n";
 
-export const FIXTURE_CHECKS: CheckSet = {
-  add_returns_sum: (ws) => ws.read("src/add.ts")?.includes("a + b") === true,
-  tests_unchanged: (ws) => ws.read("tests/add.test.ts") === FIXTURE_FILES["tests/add.test.ts"],
+/** The fixture's commands, keyed by argv. The first two are also the task's `doneWhen` checks. */
+export const FIXTURE_COMMANDS: CommandTable = {
+  "pnpm test": (ws) =>
+    ws.read("src/add.ts")?.includes("a + b") === true
+      ? { exitCode: 0, output: "1 passed" }
+      : { exitCode: 1, output: "FAIL tests/add.test.ts: expected add(2, 3) to be 5" },
+  "git diff --exit-code -- tests": (ws) =>
+    ws.read("tests/add.test.ts") === FIXTURE_FILES["tests/add.test.ts"]
+      ? { exitCode: 0, output: "" }
+      : { exitCode: 1, output: "tests/ changed" },
+};
+
+/** Held by the evaluator, never written into the worktree: it accepts only a real `a + b` body, not a comment. */
+export const FIXTURE_HIDDEN_BUNDLES: Readonly<Record<string, HiddenCheckBundle>> = {
+  "fixture-hidden-add": {
+    checks: [{ name: "add_body_sums", command: "node hidden/add.check.js" }],
+    commands: {
+      "node hidden/add.check.js": (ws) =>
+        /=>\s*a\s*\+\s*b\s*;/.test(ws.read("src/add.ts") ?? "") ? { exitCode: 0, output: "" } : { exitCode: 1, output: "add(2, 3) !== 5" },
+    },
+  },
 };
 
 export const FIXTURE_POLICY: Policy = {
@@ -29,34 +49,64 @@ export const FIXTURE_POLICY: Policy = {
   version: 1,
   status: "ACTIVE",
   riskClass: "low",
-  toolAllowlist: ["list_files", "read_file", "write_file", "run_check", "finish"],
+  toolAllowlist: ["list_files", "read_file", "search_code", "write_file", "apply_patch", "run_command", "finish"],
+  commandAllowlist: DEFAULT_COMMAND_ALLOWLIST.map((entry) => [...entry]),
   routingPreferences: {},
   memoryRules: { retrievalEnabled: false, writebackEnabled: false },
-  budgets: { maxSteps: 20, maxWallMs: 60_000, maxUsd: 1 },
+  budgets: { maxSteps: 40, maxUsd: 1, maxWallMinutes: 30 }, // PRD §7.8 policy defaults
   approvalRequirements: [],
   evaluationSuiteRef: null,
   promotedBy: null,
   promotedAt: null,
 };
 
-export const FIXTURE_TASK: Task = {
-  id: "task-fix-add-bug",
-  tenantId: "tenant-local",
+/** The `POST /v1/tasks` body for the fixture (PRD §15.2). */
+export const FIXTURE_CREATE_TASK: Extract<CreateTask, { mode: "build" }> = {
   projectId: "project-fixture",
   objective: "Fix add() so that it returns the sum of its arguments",
   mode: "build",
-  scope: { workspaceRef: "fixture:fix-add-bug", allowedPaths: ["src", "tests"], protectedPaths: ["tests"] },
-  doneWhen: [
-    { checkId: "add_returns_sum", description: "add(2, 3) returns 5" },
-    { checkId: "tests_unchanged", description: "tests were not edited" },
-  ],
-  authorizedTools: ["list_files", "read_file", "write_file", "run_check", "finish"],
+  scope: { repo: "fixture/fix-add-bug", commit: "fixture-commit-1" },
+  doneWhen: {
+    checks: [
+      { name: "add_returns_sum", command: "pnpm test" },
+      { name: "tests_unchanged", command: "git diff --exit-code -- tests" },
+    ],
+  },
   riskClass: "low",
-  budget: { maxSteps: 10, maxWallMs: 30_000, maxUsd: 0.5 },
-  policy: { id: FIXTURE_POLICY.id, version: FIXTURE_POLICY.version },
+  budget: { maxSteps: 10, maxUsd: 0.5, maxWallMinutes: 0.5 },
+  policyId: FIXTURE_POLICY.id,
+  policyVersion: FIXTURE_POLICY.version,
+};
+
+const SERVER_FIELDS = {
+  id: "task-fix-add-bug",
+  tenantId: "tenant-local",
   requestedBy: "fixture",
   createdAt: "2026-01-01T00:00:00.000Z",
-};
+  source: "fixture",
+} as const;
+
+function mustCreate(body: unknown): Task {
+  const created = createTask(body, SERVER_FIELDS);
+  if (!created.ok) throw new Error(`invalid fixture task: ${JSON.stringify(created.issues)}`);
+  return created.task;
+}
+
+export const FIXTURE_TASK: Task = mustCreate(FIXTURE_CREATE_TASK);
+
+/** The fixture task graded additionally by the hidden check bundle. */
+export function hiddenCheckTask(): Task {
+  return mustCreate({
+    ...FIXTURE_CREATE_TASK,
+    doneWhen: { ...FIXTURE_CREATE_TASK.doneWhen, hiddenCheckBundleRef: "fixture-hidden-add" },
+  });
+}
+
+/** The same task declared as an investigation: no `doneWhen`, no writes. */
+export function investigationTask(): Task {
+  const { projectId, objective, scope, riskClass, budget, policyId, policyVersion } = FIXTURE_CREATE_TASK;
+  return mustCreate({ projectId, objective, scope, riskClass, budget, policyId, policyVersion, mode: "investigate" });
+}
 
 export const FIXTURE_PLAN: Plan = {
   goal: "Make add() return a + b",
@@ -64,25 +114,25 @@ export const FIXTURE_PLAN: Plan = {
   steps: [
     { description: "read src/add.ts", tool: "read_file" },
     { description: "write the corrected implementation", tool: "write_file" },
-    { description: "run the sum check", tool: "run_check" },
+    { description: "run the tests", tool: "run_command" },
     { description: "finish", tool: "finish" },
   ],
-  tools: ["read_file", "write_file", "run_check", "finish"],
+  tools: ["read_file", "write_file", "run_command", "finish"],
   stopConditions: ["finish is called"],
   memoryIds: [],
-  verificationCommands: ["check:add_returns_sum"],
+  verificationCommands: ["pnpm test"],
   expectedArtifacts: ["src/add.ts"],
 };
 
 export const SOLUTION_STEPS: readonly unknown[] = [
   { tool: "read_file", args: { path: "src/add.ts" } },
   { tool: "write_file", args: { path: "src/add.ts", content: FIXED_ADD_SOURCE } },
-  { tool: "run_check", args: { checkId: "add_returns_sum" } },
+  { tool: "run_command", args: { argv: ["pnpm", "test"] } },
   { tool: "finish", args: { summary: "fixed add", claimedOutcome: "done" } },
 ];
 
 export function fixtureWorkspace(): InMemoryWorkspace {
-  return new InMemoryWorkspace(FIXTURE_TASK.scope.workspaceRef, FIXTURE_FILES);
+  return new InMemoryWorkspace(`${FIXTURE_TASK.scope.repo}@${FIXTURE_TASK.scope.commit}`, FIXTURE_FILES);
 }
 
 export function fixtureRegistry(): ToolRegistry {
@@ -90,7 +140,7 @@ export function fixtureRegistry(): ToolRegistry {
 }
 
 export function fixtureEvaluator(): CheckEvaluator {
-  return new CheckEvaluator(FIXTURE_CHECKS);
+  return new CheckEvaluator(FIXTURE_COMMANDS, FIXTURE_HIDDEN_BUNDLES);
 }
 
 /** The scripted model that solves the fixture. Pass different `steps` for failure variants. */
@@ -104,7 +154,12 @@ export interface FixtureRunOptions {
   task?: unknown;
   policy?: unknown;
   registry?: ToolRegistry;
+  commands?: CommandTable;
   signal?: AbortSignal;
+  modelTimeoutMs?: number;
+  /** Receives each backoff delay instead of waiting. */
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
   sink?: EventSink;
 }
 
@@ -118,10 +173,14 @@ export function runFixture(options: FixtureRunOptions = {}): Promise<RunResult> 
     registry: options.registry ?? fixtureRegistry(),
     evaluator: fixtureEvaluator(),
     workspace: fixtureWorkspace(),
-    checks: FIXTURE_CHECKS,
+    commands: options.commands ?? FIXTURE_COMMANDS,
+    artifacts: new InMemoryArtifactStore(),
     clock: new SteppingClock(Date.UTC(2026, 0, 1), 10),
     ids: new SequentialIds(),
     sink: options.sink,
+    modelTimeoutMs: options.modelTimeoutMs,
+    sleep: options.sleep ?? (async () => {}),
+    random: options.random ?? (() => 0.5),
   });
   return runner.execute({
     task: options.task ?? FIXTURE_TASK,
