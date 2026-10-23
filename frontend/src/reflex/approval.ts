@@ -191,8 +191,9 @@ export class ApprovalService {
     return this.store.list();
   }
 
-  approve(principal: Principal, id: string): ApprovalRequest {
-    return this.decide(principal, id, "approved", "approved");
+  approve(principal: Principal, id: string, reason = "approved"): ApprovalRequest {
+    if (reason.trim() === "") throw new ReflexError("validation_error", "an approval needs a reason");
+    return this.decide(principal, id, "approved", reason);
   }
 
   deny(principal: Principal, id: string, reason: string): ApprovalRequest {

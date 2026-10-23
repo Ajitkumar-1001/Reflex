@@ -1,13 +1,14 @@
 /*
- * Typed client for the approvals queue. Workstream B is adding the side-effect ledger in parallel, so the
- * dashboard depends only on this interface. `createMockApprovalsClient` is the stand-in: same inputs and
- * errors the real client will have, with no network and no Reflex domain imports.
+ * Typed client for the approvals queue. The dashboard depends only on this interface.
+ * `ledger-approvals.ts` is the real adapter over the Phase 2 approval service. `createMockApprovalsClient`
+ * below is for tests: same inputs and errors, with no Reflex domain imports.
  */
 
-export const APPROVAL_STATUSES = ["pending", "approved", "denied"] as const;
+export const APPROVAL_STATUSES = ["pending", "approved", "denied", "expired"] as const;
 export type ApprovalStatus = (typeof APPROVAL_STATUSES)[number];
 
-export const APPROVAL_EFFECTS = ["external_write", "workspace_write", "network"] as const;
+/** The side-effect classes a tool declares (`SideEffectClass` in the contracts). */
+export const APPROVAL_EFFECTS = ["read_only", "workspace_write", "external_write"] as const;
 export type ApprovalEffect = (typeof APPROVAL_EFFECTS)[number];
 
 export type ApprovalDecision = "approve" | "deny";
@@ -44,7 +45,7 @@ export class ApprovalClientError extends Error {
   readonly name = "ApprovalClientError";
 
   constructor(
-    readonly code: "not_found" | "already_decided" | "validation_error",
+    readonly code: "not_found" | "already_decided" | "validation_error" | "forbidden",
     message: string,
   ) {
     super(message);
@@ -57,6 +58,8 @@ export function approvalNotice(notice: string | string[] | undefined, id: string
   if ((notice !== "approved" && notice !== "denied") || id === undefined || !/^apr-[a-z0-9-]+$/.test(id)) return null;
   return notice === "approved" ? `${id} was approved.` : `${id} was denied.`;
 }
+
+export const STATUS_MESSAGE = "Status must be pending, approved, denied, or expired.";
 
 export function isApprovalStatus(value: string): value is ApprovalStatus {
   return (APPROVAL_STATUSES as readonly string[]).includes(value);
@@ -71,7 +74,7 @@ export function parseApprovalStatus(
   const trimmed = value.trim();
   if (trimmed.length === 0 || trimmed === "all") return { ok: true };
   if (!isApprovalStatus(trimmed)) {
-    return { ok: false, message: "Status must be pending, approved, or denied." };
+    return { ok: false, message: STATUS_MESSAGE };
   }
   return { ok: true, status: trimmed };
 }
@@ -96,7 +99,7 @@ export const MOCK_APPROVAL_SEED: readonly ApprovalRecord[] = [
   },
   {
     id: "apr-webhook-sub",
-    effect: "network",
+    effect: "external_write",
     tool: "webhook",
     summary: "POST the sub() evaluation verdict to the CI callback.",
     runId: "run-2",
@@ -122,7 +125,7 @@ export const MOCK_APPROVAL_SEED: readonly ApprovalRecord[] = [
   },
   {
     id: "apr-summarizer",
-    effect: "network",
+    effect: "external_write",
     tool: "http_request",
     summary: "Send repository contents to an external summarizer.",
     runId: "run-1",
@@ -136,6 +139,11 @@ export const MOCK_APPROVAL_SEED: readonly ApprovalRecord[] = [
 ];
 
 const copy = <T>(value: T): T => structuredClone(value);
+
+/** Newest request first. Equal times fall back to id order so the listing is stable. */
+export function newestFirst(a: ApprovalRecord, b: ApprovalRecord): number {
+  return a.requestedAt === b.requestedAt ? (a.id < b.id ? -1 : 1) : a.requestedAt < b.requestedAt ? 1 : -1;
+}
 
 export function createMockApprovalsClient(options?: {
   seed?: readonly ApprovalRecord[];
@@ -151,11 +159,11 @@ export function createMockApprovalsClient(options?: {
   return {
     async list(query) {
       if (query?.status !== undefined && !isApprovalStatus(query.status)) {
-        throw new ApprovalClientError("validation_error", "Status must be pending, approved, or denied.");
+        throw new ApprovalClientError("validation_error", STATUS_MESSAGE);
       }
       return [...records.values()]
         .filter((record) => query?.status === undefined || record.status === query.status)
-        .sort((a, b) => (a.requestedAt === b.requestedAt ? (a.id < b.id ? -1 : 1) : a.requestedAt < b.requestedAt ? 1 : -1))
+        .sort(newestFirst)
         .map(copy);
     },
 
@@ -180,12 +188,4 @@ export function createMockApprovalsClient(options?: {
       return copy(next);
     },
   };
-}
-
-let singleton: ApprovalsClient | null = null;
-
-/** One ledger per server process. The page and the approve/deny action share it. */
-export function getApprovalsClient(): ApprovalsClient {
-  singleton ??= createMockApprovalsClient();
-  return singleton;
 }

@@ -2,7 +2,8 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { ApprovalClientError, getApprovalsClient, isApprovalStatus } from "@/client/approvals";
+import { ApprovalClientError, isApprovalStatus } from "@/client/approvals";
+import { getApprovalsClient } from "@/client/ledger-approvals";
 
 export interface DecisionState {
   message: string | null;

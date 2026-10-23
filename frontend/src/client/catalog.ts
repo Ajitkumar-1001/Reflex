@@ -2,7 +2,7 @@
  * Dashboard read model over the Phase 1 in-memory store and MemoryExplorer.
  * The seed runs the existing lab (no domain changes) so the pages have runs, memories, and an A/B report.
  * Ids are deterministic: run-1 is the add train run, run-2 the sub train run, run-3 the memory-on mul demo.
- * The mock approvals ledger links to those three. Do not insert another run ahead of them.
+ * The demo approval requests (`ledger-approvals.ts`) link to those three. Do not insert another run ahead of them.
  */
 
 import { ReflexError } from "../reflex/access";

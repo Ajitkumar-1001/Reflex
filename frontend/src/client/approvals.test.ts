@@ -17,13 +17,14 @@ describe("parseApprovalStatus", () => {
     expect(parseApprovalStatus("all")).toEqual({ ok: true });
   });
 
-  it("accepts the three ledger statuses and rejects anything else", () => {
+  it("accepts the four ledger statuses and rejects anything else", () => {
     expect(parseApprovalStatus(" pending ")).toEqual({ ok: true, status: "pending" });
     expect(parseApprovalStatus("approved")).toEqual({ ok: true, status: "approved" });
     expect(parseApprovalStatus("denied")).toEqual({ ok: true, status: "denied" });
+    expect(parseApprovalStatus("expired")).toEqual({ ok: true, status: "expired" });
     expect(parseApprovalStatus("rejected")).toEqual({
       ok: false,
-      message: "Status must be pending, approved, or denied.",
+      message: "Status must be pending, approved, denied, or expired.",
     });
     expect(parseApprovalStatus(["pending", "denied"])).toEqual({
       ok: false,
