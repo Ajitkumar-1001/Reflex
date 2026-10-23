@@ -268,7 +268,18 @@ export const PolicySchema = z.strictObject({
   /** argv prefixes `run_command` may execute, e.g. ["npx","tsc"] (PRD §11 assigns the allowlist to the policy). */
   commandAllowlist: z.array(z.array(NonEmpty).min(1)),
   routingPreferences: z.record(z.string(), z.string()),
-  memoryRules: z.strictObject({ retrievalEnabled: z.boolean(), writebackEnabled: z.boolean() }),
+  /**
+   * `maxCards` and `maxContextTokens` are the PRD §9.2 context budget ("the cap is policy configuration");
+   * `autoApprove` lists the memory kinds the write gate may approve without a human (PRD §9.3, DEC-05).
+   * Absent fields fall back to the v1.4 proposed defaults at the point of use, so Phase 0 policies still parse.
+   */
+  memoryRules: z.strictObject({
+    retrievalEnabled: z.boolean(),
+    writebackEnabled: z.boolean(),
+    maxCards: z.int().positive().optional(),
+    maxContextTokens: z.int().positive().optional(),
+    autoApprove: z.array(z.enum(["episodic", "semantic", "procedural", "playbook_item"])).optional(),
+  }),
   budgets: Budget,
   approvalRequirements: z.array(NonEmpty),
   evaluationSuiteRef: z.string().nullable(),
@@ -289,9 +300,19 @@ export const RunSchema = z
     modelConfig: z.strictObject({ provider: NonEmpty, model: NonEmpty, version: NonEmpty }),
     promptTemplateVersion: NonEmpty,
     toolRegistryVersion: NonEmpty,
-    /** Memory-off baseline records no retrieval index; Phase 1 widens this. */
-    retrievalSnapshot: z.strictObject({ mode: z.literal("disabled"), indexVersion: z.null() }),
+    /**
+     * What retrieval looked like for this run (INV-05). `disabled` is arm A; `hybrid` pins the index and
+     * embedding versions; `degraded` is a retrieval that failed and ran memory-less (PRD §7.8), which
+     * experiments exclude from A/B statistics.
+     */
+    retrievalSnapshot: z.discriminatedUnion("mode", [
+      z.strictObject({ mode: z.literal("disabled"), indexVersion: z.null() }),
+      z.strictObject({ mode: z.literal("hybrid"), indexVersion: NonEmpty, embeddingModel: NonEmpty, embeddingVersion: NonEmpty }),
+      z.strictObject({ mode: z.literal("degraded"), indexVersion: z.null() }),
+    ]),
     configArm: z.enum(["A", "B", "C"]),
+    experimentId: Id.optional(),
+    trialIndex: z.int().nonnegative().optional(),
     workspaceRef: NonEmpty,
     startWorkspaceHash: NonEmpty,
     endWorkspaceHash: NonEmpty.nullable(),
@@ -457,7 +478,41 @@ export const EventSchema = z.discriminatedUnion("type", [
     "evaluator_tamper_flag",
     z.strictObject({ evaluationId: Id, touchedProtectedPaths: z.array(NonEmpty), signals: z.array(NonEmpty) }),
   ),
-  eventVariant("reflection_skipped", z.strictObject({ reason: z.literal("memory_disabled") })),
+  eventVariant("reflection_skipped", z.strictObject({ reason: z.enum(["memory_disabled", "not_eligible", "writeback_disabled"]) })),
+  eventVariant(
+    "retrieval_recorded",
+    z.strictObject({
+      indexVersion: NonEmpty,
+      considered: z.int().nonnegative(),
+      excluded: z.record(z.string(), z.int().nonnegative()),
+      injected: z.array(z.strictObject({ memoryId: Id, version: z.int().positive(), rank: z.int().positive(), score: z.number() })),
+      contextTokens: z.int().nonnegative(),
+    }),
+  ),
+  eventVariant("retrieval_degraded", z.strictObject({ reason: NonEmpty })),
+  eventVariant("reflection_recorded", z.strictObject({ reflection: ReflectionSchema, candidates: z.int().nonnegative() })),
+  eventVariant("reflection_failed", z.strictObject({ cause: z.enum(["unavailable", "invalid"]), detail: z.string() })),
+  eventVariant("writeback_blocked", z.strictObject({ reason: z.enum(["frozen_test_split", "repository_frozen"]) })),
+  eventVariant(
+    "memory_lifecycle",
+    z.strictObject({
+      memoryId: Id,
+      from: LifecycleState.nullable(),
+      to: LifecycleState,
+      version: z.int().positive(),
+      reasonCode: NonEmpty,
+    }),
+  ),
+  eventVariant(
+    "quarantine_recorded",
+    z.strictObject({
+      selector: z.enum(["memory", "run", "task", "time_range"]),
+      memoryIds: z.array(Id),
+      runIds: z.array(Id),
+      reason: NonEmpty,
+      restored: z.boolean(),
+    }),
+  ),
   eventVariant(
     "memory_use",
     z.strictObject({
@@ -508,6 +563,7 @@ export const MemoryCandidateSchema = z
     applicability: z.strictObject({
       projectId: Id,
       stack: z.array(NonEmpty).optional(),
+      taskClass: NonEmpty.optional(),
       conditions: z.array(NonEmpty),
     }),
     evidenceStatus: EvidenceStatus,
@@ -529,7 +585,7 @@ export const MemoryCandidateSchema = z
   });
 export type MemoryCandidate = z.infer<typeof MemoryCandidateSchema>;
 
-/** The `memories` collection record (PRD §10, v1.1 additions, §15.2 `Memory`). Nothing writes it in Phase 0. */
+/** The `memories` collection record (PRD §10, v1.1 additions, §15.2 `Memory`). */
 export const MemoryRecordSchema = z.strictObject({
   id: Id,
   tenantId: Id,
@@ -540,6 +596,8 @@ export const MemoryRecordSchema = z.strictObject({
   tags: z.array(z.string()),
   scope: z.strictObject({
     stack: z.array(NonEmpty).optional(),
+    /** The task family the lesson applies to (PRD §7.3 "task type"); how it is labelled is an open question. */
+    taskClass: NonEmpty.optional(),
     environment: z.string().optional(),
     toolVersions: z.record(z.string(), z.string()).optional(),
     conditions: z.array(NonEmpty),
@@ -561,5 +619,9 @@ export const MemoryRecordSchema = z.strictObject({
   gateDecision: GateDecisionSchema.nullable(),
   derivedFromMemoryIds: z.array(Id),
   contentHash: NonEmpty,
+  /** `updatedAt` backs the §10 `(…, updated_at)` index; `lastUsedAt` backs the §9.6 episodic idle rule. */
+  createdAt: Timestamp,
+  updatedAt: Timestamp,
+  lastUsedAt: Timestamp.nullable(),
 });
 export type MemoryRecord = z.infer<typeof MemoryRecordSchema>;
