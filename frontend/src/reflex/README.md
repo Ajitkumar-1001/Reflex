@@ -16,6 +16,7 @@ embedding service or sandbox: every one of those is behind a port, and the stand
 pnpm test        # Phase 0: contracts, admission, permission, tools, integrity, failures, exit gate, baseline
                  # Phase 1: store, retrieval, gate, lifecycle, memory runner, experiment, explorer, exit gate
                  # Phase 2 ledger: side-effect ledger, approval pause/approve/deny/expiry, tool runner
+                 # Phase 2: trace and artifact retention (TTL, size cap, legal hold, audit, content hash)
 ```
 
 Phase 1 is described from "Phase 1 (§20)" below; everything above that heading is unchanged Phase 0 text except
@@ -133,7 +134,7 @@ implement the same interface.
 | `RunEngine` | `ReferenceRunner` | DEC-01 (orchestrator) |
 | `Workspace`, `CommandTable`, `InfraFailureError` | `InMemoryWorkspace`, scripted commands; no isolation claimed. Sandbox escape tests (§27) and checks run from a pinned image are not possible yet | DEC-02 (Docker sandbox) |
 | `ModelAdapter` | `ScriptedModel`; `ModelUnavailableError` drives the §7.8 retries | DEC-10 (pinned models, spend); DEC-04 (repo privacy, `cloud_not_permitted`, never produced); DEC-12 (judge model) |
-| `EventSink`, `ArtifactStore` | Optional callback; `InMemoryArtifactStore` keyed by sha256 | DEC-08 (six collections, Atlas `events`); DEC-05 (artifact and trace retention) |
+| `EventSink`, `ArtifactStore` | Optional callback; `InMemoryArtifactStore` keyed by sha256. Phase 2 adds `TraceRetentionStore` for expiry (see Phase 2) | DEC-08 (six collections, Atlas `events`); DEC-05 (the retention numbers are still open) |
 | Durable queue, leases, resume | None; the runner is called directly | DEC-03 (BullMQ/Redis; Phase 2) |
 | Memory layer | Phase 1, see "Phase 1 seams" below | DEC-05, DEC-06, DEC-08, DEC-10, DEC-11, DEC-12, DEC-13 |
 | Cody / standalone integration | None. Standalone | DEC-07 |
@@ -346,6 +347,35 @@ Cancelling while paused does not run the mutation. The idempotency key on the `t
 - The grant lasts 24 hours unless the caller passes `ttlMs`. The PRD does not give a number.
 - A tool timeout or a thrown tool settles the ledger `failed` and is not dispatched again.
 - `recoverInterruptedRun` still marks a paused run `FAILED/internal_error`. Resuming it across a process is the queue workstream's checkpoint, not this ledger.
+# Phase 2 workstream C: trace and artifact retention
+
+PRD §20's hardened execution asks for retention of traces, artifacts and evaluations. DEC-05 is still open, so
+this is an in-memory stand-in behind `TraceRetentionStore`. No dependency was added. The runner is unchanged:
+it still writes tool output through `InMemoryArtifactStore`, and nothing calls the sweeper from a run.
+
+| File | Purpose |
+|---|---|
+| `trace-retention.ts` | `TraceRetentionPolicy` / `PROPOSED_TRACE_RETENTION` (TTL and max bytes per kind: events, artifacts, evaluations), `InMemoryTraceRetentionStore`, `RetentionSweeper`, `checkArtifactIntegrity` |
+
+`pnpm test` covers expiry by TTL, the size cap (oldest unpinned first), approved-provenance and open-evaluation
+holds, one `retention_pruned` audit event per deletion, redaction, and artifact hash mismatch.
+
+## Readings (not decisions)
+
+- **An evaluation is open only as a hold.** `EvaluationResult` is a finished verdict and has no status. The
+  retention record's `open | closed` flag is the legal hold. Open pins that evaluation, its run's events, check
+  `artifactRef`s, and evidence refs (`evaluation:`, `event:<run>:<sequence>`, `run:`, `sha256:`, `artifact:`).
+- **Approved provenance is `sourceRunIds` and `evaluationIds`.** The stored memory does not keep `evidenceRefs`.
+  A source run pins every event of that run and those events' `artifactRef`s. A candidate, rejected, demoted or
+  quarantined memory does not pin. Refs inside an unpinned trace are not walked.
+- **The prune audit is its own log.** It is not a run `EventSchema` variant: appending it onto the trace being
+  deleted would break `(run_id, sequence)`. The payload is ids, kind, reason, byte count, content hash and a
+  redaction flag. The record body is not copied, and a surviving event's `redactedPayload` is not rewritten.
+- **Pinned bytes may exceed `maxBytes`.** The sweep reports `unmetCaps` and still does not delete the pin.
+- **`PROPOSED_TRACE_RETENTION` is a stand-in** (30 days for events and artifacts, 180 days for evaluations,
+  byte caps for this process). It is not in v1.4. Replacing the object is the whole change once DEC-05 lands.
+  Artifact ids are `sha256:<hex>` of the content, the same form as Phase 0 `artifactRef`. A later put of the
+  same bytes does not move `storedAt`.
 
 ## Deferred
 
@@ -355,3 +385,7 @@ Cancelling while paused does not run the mutation. The idempotency key on the `t
 | HTTP approve/deny routes, tokens | §15 and §17.0 are still proposed defaults. The service is callable in process. |
 | Retry of an `intended` row after a crash | At-most-once: a crash between the record and the call is not distinguishable from a call that happened. |
 | Ledger rows inside the trace collections | The transition reason and the approval record hold why. Trace retention is the other workstream. |
+| Calling the sweeper from `ReferenceRunner` or sharing `InMemoryStore`'s maps | The runner and the six-collection store are shared seams; this workstream keeps its own store |
+| `retention_pruned` on the run trace, Atlas TTL indexes, object-storage lifecycle | DEC-08 and DEC-05; the audit log is the stand-in |
+| A retention TTL for the audit log itself | The log is what proves a prune; expiring it is a separate DEC-05 choice |
+| Redacting tool `argsSummary`, plan text or raw artifact bytes on the way in | Still the Phase 0 gap. Retention does not un-redact, and it does not start scrubbing |
