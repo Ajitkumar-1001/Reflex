@@ -2,7 +2,8 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { ApprovalClientError, getApprovalsClient, isApprovalStatus } from "@/client/approvals";
+import { ApprovalClientError, isApprovalStatus, parseDecisionForm } from "@/client/approvals";
+import { getApprovalsClient } from "@/client/ledger-approvals";
 
 export interface DecisionState {
   message: string | null;
@@ -20,16 +21,12 @@ function returnQuery(returnStatus: FormDataEntryValue | null, notice: "approved"
 
 /** The approve and deny buttons submit here. The handler calls the typed approvals client and nothing else. */
 export async function decideApproval(_previous: DecisionState, formData: FormData): Promise<DecisionState> {
-  const id = formData.get("id");
-  const decision = formData.get("decision");
-  const reason = formData.get("reason");
-  if (typeof id !== "string" || id.length === 0) return { message: "Missing approval id." };
-  if (decision !== "approve" && decision !== "deny") return { message: "Choose approve or deny." };
-  if (typeof reason !== "string" || reason.trim().length === 0) return { message: "A decision needs a reason." };
+  const input = parseDecisionForm({ id: formData.get("id"), decision: formData.get("decision"), reason: formData.get("reason") });
+  if (!input.ok) return { message: input.message };
 
   let status: "approved" | "denied";
   try {
-    const record = await getApprovalsClient().decide(id, decision, { actor: "dashboard-operator", reason });
+    const record = await getApprovalsClient().decide(input.id, input.decision, { actor: "dashboard-operator", reason: input.reason });
     status = record.status === "denied" ? "denied" : "approved";
   } catch (error) {
     if (error instanceof ApprovalClientError) return { message: error.message };
@@ -37,5 +34,5 @@ export async function decideApproval(_previous: DecisionState, formData: FormDat
   }
 
   revalidatePath("/approvals");
-  redirect(`/approvals?${returnQuery(formData.get("returnStatus"), status, id)}`);
+  redirect(`/approvals?${returnQuery(formData.get("returnStatus"), status, input.id)}`);
 }

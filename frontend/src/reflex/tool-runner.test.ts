@@ -5,6 +5,7 @@ import type { ApprovalSubject } from "./approval";
 import { InMemoryArtifactStore, InMemoryWorkspace, SequentialIds, defineTool } from "./adapters";
 import type { Principal } from "./access";
 import type { SideEffectClass } from "./contracts";
+import { WorkerCrash } from "./execution/handoff";
 import { effectKey } from "./ledger";
 import { InMemorySideEffectLedger } from "./ledger";
 import { InfraFailureError } from "./ports";
@@ -226,6 +227,20 @@ describe("tool runner", () => {
     expect(first.kind === "executed" && first.infraFailure?.message).toBe("docker daemon unreachable");
     expect(ledger.list()[0]?.state).toBe("failed");
     await dispatch(tool, { ledger, grants });
+    expect(calls).toBe(1);
+  });
+
+  it("hands a worker crash back to the caller, leaves the row intended, and does not run the mutation again", async () => {
+    const ledger = new InMemorySideEffectLedger();
+    let calls = 0;
+    const tool = adapter("write_note", "workspace_write", async () => {
+      calls += 1;
+      throw new WorkerCrash();
+    });
+    const grants = new InMemoryApprovalStore();
+    await expect(dispatch(tool, { ledger, grants })).rejects.toBeInstanceOf(WorkerCrash);
+    expect(ledger.list().map((record) => record.state)).toEqual(["intended"]);
+    expect(await dispatch(tool, { ledger, grants })).toMatchObject({ kind: "replayed", state: "intended", output: null });
     expect(calls).toBe(1);
   });
 });

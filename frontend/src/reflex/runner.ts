@@ -63,8 +63,8 @@ import type {
   ToolOutput,
   Workspace,
 } from "./ports";
-import { RunHandoff } from "./execution/handoff";
-import type { CheckpointPhase, RunCheckpoint, RunExecution } from "./execution/types";
+import { ApprovalPending, RunHandoff } from "./execution/handoff";
+import type { CheckpointPhase, PendingApproval, RunCheckpoint, RunExecution } from "./execution/types";
 import { episodicCandidate, parseReflection, redactReflection, reflectionCandidate } from "./reflection";
 import { HybridRetriever } from "./retrieval";
 import type { RetrievalConfig } from "./retrieval";
@@ -148,15 +148,16 @@ export interface RunnerDeps {
   /** Absent: memory is disabled whatever the policy says, and a policy that enables it is blocked. */
   memory?: MemoryRuntime;
   /**
+   * Phase 2 side effects. Absent: external writes stay denied and the trace matches the memory-off
+   * baseline. Present: mutations are ledgered before they run, and an action that requires approval pauses.
+   */
+  effects?: EffectRuntime;
+  /**
    * Durable execution (Phase 2). Absent: this attempt is the non-durable loop and traces match Phase 0/1.
    * Present: checkpoints are written at step boundaries, a stored checkpoint is resumed, and cancellation
    * requested through it stops the run at the next boundary.
    */
   execution?: RunExecution;
-   * Phase 2 side effects. Absent: external writes stay denied and the trace matches the memory-off
-   * baseline. Present: mutations are ledgered before they run, and an action that requires approval pauses.
-   */
-  effects?: EffectRuntime;
 }
 
 export interface EffectRuntime {
@@ -226,6 +227,8 @@ export class ReferenceRunner implements RunEngine {
     let executionFinished = saved?.executionFinished ?? false;
     let cards: MemoryCard[] = saved ? structuredClone(saved.cards) : [];
     let memoryBlock = saved?.memoryBlock ?? "";
+    /** The call this run is paused on. Set from the pause until the approval is decided or the run ends. */
+    let awaiting: PendingApproval | null = saved?.awaiting ?? null;
 
     const run: Run = saved
       ? structuredClone(saved.run)
@@ -323,6 +326,7 @@ export class ReferenceRunner implements RunEngine {
       executionFinished,
       cards: structuredClone(cards),
       memoryBlock,
+      ...(awaiting ? { awaiting: structuredClone(awaiting) } : {}),
     });
 
     // No await on the memory-off path: awaiting a resolved promise would yield, and the baseline trace
@@ -554,11 +558,15 @@ export class ReferenceRunner implements RunEngine {
       if (!executionFinished) {
       for (let finished = false; !finished; ) {
         checkLimits();
-        const call = await callModel("step", ToolCallRequest, (validationError) =>
-          model.nextStep({ step: run.steps + 1, plan: currentPlan, observations, validationError }),
-        );
-        run.steps++;
-        const callId = ids.next("call");
+        // A resumed pause re-enters the step it paused on: the model is not asked again and the step is not counted twice.
+        const resumed = awaiting;
+        const call =
+          resumed?.call ??
+          (await callModel("step", ToolCallRequest, (validationError) =>
+            model.nextStep({ step: run.steps + 1, plan: currentPlan, observations, validationError }),
+          ));
+        if (!resumed) run.steps++;
+        const callId = resumed?.callId ?? ids.next("call");
         const decision = authorizeToolCall(call, accessContext);
 
         if (!decision.allowed) {
@@ -585,27 +593,15 @@ export class ReferenceRunner implements RunEngine {
 
         let output: ToolOutput;
         let infraFailure: InfraFailureError | null = null;
-        try {
-          output = await withTimeout(
-            decision.tool.execute(decision.args, { workspace, scope: task.scope, commands, artifacts }),
-            decision.tool.descriptor.timeoutMs,
-          );
-        } catch (error) {
-          if (error instanceof RunHandoff) throw error;
-          if (error instanceof InfraFailureError) infraFailure = error;
-          output =
-            error instanceof InfraFailureError
-              ? { ok: false, summary: "sandbox unavailable", observation: error.message }
-              : error instanceof TimedOut
-              ? { ok: false, summary: "tool timed out", observation: `${name} timed out after ${decision.tool.descriptor.timeoutMs} ms` }
-              : { ok: false, summary: "tool raised an error", observation: error instanceof Error ? error.message : "tool error" };
         let effectKeyForEvent: string | undefined;
         let startedMs: number;
         if (effects) {
           let approvalId: string | null = null;
           if (actionRequiresApproval(decision.tool, policy.approvalRequirements)) {
             const idempotencyKey = effectKey(runId, run.steps, name, decision.args).key;
-            const approval = effects.approvals.request({
+            const known = resumed ? effects.approvals.get(resumed.approvalId) : undefined;
+            if (resumed && !known) throw new Error(`approval ${resumed.approvalId} is missing`);
+            const approval = known ?? effects.approvals.request({
               runId,
               taskId: task.id,
               step: run.steps,
@@ -622,9 +618,20 @@ export class ReferenceRunner implements RunEngine {
               requestedBy: task.requestedBy,
             });
             approvalId = approval.id;
-            moveTo("AWAITING_APPROVAL", `approval required for ${name}`);
+            if (!resumed) {
+              moveTo("AWAITING_APPROVAL", `approval required for ${name}`);
+              awaiting = { approvalId: approval.id, callId, call };
+              const paused = persist("executing");
+              if (paused) await paused;
+            } else {
+              // ponytail: closes every request past its deadline, not only this one. Narrow it if approvals get their own sweeper.
+              effects.approvals.expireDue();
+            }
             try {
+              // A durable attempt does not sit on its lease for a human: it hands the job back until a decision lands.
+              if (execution && effects.approvals.get(approval.id)?.status === "pending") throw new ApprovalPending(approval.id);
               const resolved = await effects.approvals.wait(approval.id, request.signal);
+              awaiting = null;
               if (resolved.status !== "approved") {
                 const reason = resolved.status === "expired" ? "approval_expired" : "approval_denied";
                 throw new Stop("BLOCKED", "blocked", reason, resolved.reason ?? reason);
@@ -683,6 +690,7 @@ export class ReferenceRunner implements RunEngine {
               decision.tool.descriptor.timeoutMs,
             );
           } catch (error) {
+            if (error instanceof RunHandoff) throw error;
             if (error instanceof InfraFailureError) infraFailure = error;
             output =
               error instanceof InfraFailureError
@@ -765,6 +773,10 @@ export class ReferenceRunner implements RunEngine {
     } catch (error) {
       if (error instanceof RunHandoff) throw error;
       if (isTerminal(run.status)) throw error;
+      if (awaiting) {
+        effects?.approvals.failClosed(awaiting.approvalId, "run ended while awaiting approval");
+        awaiting = null;
+      }
       if (error instanceof Stop) stop(error.state, error.outcome, error.reason, error.detail);
       else stop("FAILED", "failed", "internal_error", error instanceof Error ? error.message : "unknown error");
     }

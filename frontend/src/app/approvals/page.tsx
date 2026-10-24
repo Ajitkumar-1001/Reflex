@@ -1,7 +1,8 @@
 import type { Metadata } from "next";
 import Link from "next/link";
-import { approvalNotice, getApprovalsClient, parseApprovalStatus } from "@/client/approvals";
+import { approvalNotice, parseApprovalStatus } from "@/client/approvals";
 import type { ApprovalStatus } from "@/client/approvals";
+import { getApprovalsClient } from "@/client/ledger-approvals";
 import { formatTimestamp } from "@/client/views";
 import { loadCatalog } from "../_components/load";
 import { DecisionForm } from "./decision-form";
@@ -14,6 +15,7 @@ const FILTERS: { href: string; label: string; status?: ApprovalStatus }[] = [
   { href: "/approvals?status=pending", label: "Pending", status: "pending" },
   { href: "/approvals?status=approved", label: "Approved", status: "approved" },
   { href: "/approvals?status=denied", label: "Denied", status: "denied" },
+  { href: "/approvals?status=expired", label: "Expired", status: "expired" },
 ];
 
 export default async function ApprovalsPage({
@@ -29,7 +31,7 @@ export default async function ApprovalsPage({
   if (!parsed.ok) {
     return (
       <>
-        <PageHeader title="Approvals" lede="Side-effect approvals. The queue is a typed client with mock data until the ledger service lands." />
+        <PageHeader title="Approvals" lede="Side-effect approvals, read from the Phase 2 approval service." />
         <div className="mt-6">
           <ErrorState title="That status is not valid">
             <p>{parsed.message}</p>
@@ -51,7 +53,7 @@ export default async function ApprovalsPage({
     <>
       <PageHeader
         title="Approvals"
-        lede="Pending, approved, and denied side effects. Approve and deny call the mock ledger client. Runs and memories on the other pages stay read-only."
+        lede="Pending, approved, denied, and expired side effects. Approve and deny go through the in-memory approval service, which holds demo requests that no run is waiting on. Runs and memories on the other pages stay read-only."
       />
       <nav aria-label="Approval status" className="mt-6">
         <ul className="flex flex-wrap gap-2">
@@ -83,8 +85,8 @@ export default async function ApprovalsPage({
           <EmptyState title={parsed.status ? `No ${parsed.status} approvals` : "No approvals"}>
             <p>
               {parsed.status === "pending"
-                ? "Nothing is waiting. Approved and denied decisions are on the other filters."
-                : "The mock ledger has no rows for this filter."}
+                ? "Nothing is waiting. Decided requests are on the other filters."
+                : "The approval service has no rows for this filter."}
             </p>
           </EmptyState>
         ) : (

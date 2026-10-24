@@ -15,8 +15,8 @@ embedding service or sandbox: every one of those is behind a port, and the stand
 ```
 pnpm test        # Phase 0: contracts, admission, permission, tools, integrity, failures, exit gate, baseline
                  # Phase 1: store, retrieval, gate, lifecycle, memory runner, experiment, explorer, exit gate
-                 # Phase 2 ledger: side-effect ledger, approval pause/approve/deny/expiry, tool runner
                  # Phase 2: trace and artifact retention (TTL, size cap, legal hold, audit, content hash)
+                 # Phase 2 ledger: side-effect ledger, approval pause/approve/deny/expiry, tool runner
 ```
 
 Phase 1 is described from "Phase 1 (§20)" below; everything above that heading is unchanged Phase 0 text except
@@ -135,10 +135,8 @@ implement the same interface.
 | `RunEngine` | `ReferenceRunner` | DEC-01 (orchestrator) |
 | `Workspace`, `CommandTable`, `InfraFailureError` | `InMemoryWorkspace`, scripted commands; no isolation claimed. Sandbox escape tests (§27) and checks run from a pinned image are not possible yet | DEC-02 (Docker sandbox) |
 | `ModelAdapter` | `ScriptedModel`; `ModelUnavailableError` drives the §7.8 retries | DEC-10 (pinned models, spend); DEC-04 (repo privacy, `cloud_not_permitted`, never produced); DEC-12 (judge model) |
-| `EventSink`, `ArtifactStore` | Optional callback; `InMemoryArtifactStore` keyed by sha256 | DEC-08 (six collections, Atlas `events`); DEC-05 (artifact and trace retention) |
-| Durable queue, leases, resume | `execution/`: `JobQueue` plus an in-memory adapter, per-step checkpoints, worker leases. No BullMQ or Redis client | DEC-03 (a BullMQ/Redis adapter is still the open choice; the interface is what it would implement) |
 | `EventSink`, `ArtifactStore` | Optional callback; `InMemoryArtifactStore` keyed by sha256. Phase 2 adds `TraceRetentionStore` for expiry (see Phase 2) | DEC-08 (six collections, Atlas `events`); DEC-05 (the retention numbers are still open) |
-| Durable queue, leases, resume | None; the runner is called directly | DEC-03 (BullMQ/Redis; Phase 2) |
+| Durable queue, leases, resume | `execution/`: `JobQueue` plus an in-memory adapter, per-step checkpoints, worker leases. No BullMQ or Redis client | DEC-03 (a BullMQ/Redis adapter is still the open choice; the interface is what it would implement) |
 | Memory layer | Phase 1, see "Phase 1 seams" below | DEC-05, DEC-06, DEC-08, DEC-10, DEC-11, DEC-12, DEC-13 |
 | Cody / standalone integration | None. Standalone | DEC-07 |
 
@@ -149,11 +147,9 @@ Not implemented, and not stubbed: Atlas client, Redis/BullMQ, S3, OpenTelemetry 
 §17.0 tokens and authentication (FR-29; the role matrix itself exists as `access.ts`), redaction of tool-call
 `argsSummary` and plan text in events (they are truncated but not scrubbed; reflections and stored memories are
 scanned and redacted, see Phase 1), a filesystem artifact store and the §27 environment configuration, the
-one-active-run unique index (`409 run_active`), `reflexVersion` on runs, and P1's
-`WAITING_APPROVAL` / `RETRY_PENDING` states. Per-step checkpoints for a run that went through the Phase 2
-worker are described below; `recoverInterruptedRun` is still what a bare `ReferenceRunner` gets.
-one-active-run unique index (`409 run_active`), `reflexVersion` on runs, run `checkpoint`, and
-`RETRY_PENDING` (the queue workstream). `AWAITING_APPROVAL` is the Phase 2 pause; see the last section.
+one-active-run unique index (`409 run_active`), `reflexVersion` on runs, and `RETRY_PENDING`.
+`AWAITING_APPROVAL` is the Phase 2 pause; see the last section. Per-step checkpoints for a run that went through
+the Phase 2 worker are described below; `recoverInterruptedRun` is still what a bare `ReferenceRunner` gets.
 
 ---
 
@@ -342,43 +338,12 @@ memory-off. The in-memory `JobQueue` is the only adapter. DEC-03 (BullMQ/Redis) 
 | Checkpoints | Written after the plan is committed, after each tool step (including a denial), after evaluation, and when the run is terminal. A crash mid-step leaves the previous snapshot; the partial workspace write is discarded |
 | Resume | The next attempt restores the run, the trace, id counters, and the stepping clock, and continues at the next step. A terminal checkpoint is returned and not executed again, so a lost ack does not repeat side effects |
 | Cancel | `cancel(dispatchId)` is read at the next step boundary (also before evaluation and reflection). The run stops `CANCELLED` / `cancelled` / `user_cancel`. The in-flight step is allowed to finish |
+| Paused for approval | A run that reaches an approval-required tool checkpoints in `AWAITING_APPROVAL` (with the call it paused on) and the attempt ends as `paused`; the job is offered again after the base backoff and no attempt is charged. A resume reads the approval: pending pauses again, approved continues, denied or expired ends `BLOCKED` (`approval_denied` / `approval_expired`), a cancel ends `CANCELLED` and closes the request. The ledger keeps the mutation to once |
 
-Cancellation uses the existing state machine. The status is `CANCELLED`; the outcome is `cancelled`. No new state was added (`WAITING_APPROVAL` and `RETRY_PENDING` stay absent).
+Cancellation uses the existing state machine. The status is `CANCELLED`; the outcome is `cancelled`. No new state was added for it (`RETRY_PENDING` stays absent; `AWAITING_APPROVAL` is the ledger workstream's pause, below).
 
 A crash during `REFLECTING` resumes at the post-evaluation checkpoint, so reflection runs again. Memory rows already inserted by that attempt are not part of the checkpoint (the memory store is the Phase 1 repository). Artifact blobs are not in the checkpoint either; retention of traces and artifacts is the other Phase 2 workstream. The `409 run_active` index is still not built. `recoverInterruptedRun` is unchanged and still marks a bare, non-leased run `FAILED/internal_error`.
-judge (DEC-10, DEC-12), `@opentelemetry/*` (§17.2). BullMQ and Redis are Phase 2 (DEC-03).
 
----
-
-# Phase 2 workstream B: side-effect ledger and approval
-
-In-process only. No new dependency. Queue leases, checkpoints, retries and cancellation are a separate
-workstream, as are trace and artifact retention. The memory-off baseline does not construct this runtime, so
-its recorded trace is unchanged.
-
-| File | Purpose |
-|---|---|
-| `ledger.ts` | `SideEffectLedger`. A mutation is inserted as `intended` under `runId:step:intentHash` before it runs, then `committed` or `failed`. A second `intend` of the same key returns the existing row and the tool runner does not execute again, including while the first attempt is still `intended` (at-most-once). |
-| `approval.ts` | `ApprovalStore` / `ApprovalService`. A request records who asked, what would run, and the task scope. It closes once: `approved`, `denied`, or `expired`. Deny and expiry keep the reason and never grant the action. |
-| `tool-runner.ts` | `dispatchEffect`, the only path that performs a side effect once an `EffectRuntime` is wired. Every `external_write`, and any tool named in `policy.approvalRequirements`, is refused unless the store holds a matching unexpired grant. Reads are not ledgered. |
-| `access.ts` | The `approve` action is owner-only, separate from a memory `decide`, so the runner cannot approve its own call. |
-
-`ReferenceRunner` takes an optional `effects` bundle. Without it, a registered external write is still denied
-(`approval_required_p0` / `external_write_not_permitted`) and a tool listed in `approvalRequirements` blocks the
-run instead of running. With it, that call moves the run to `AWAITING_APPROVAL` and resumes to `EXECUTING` only
-after an owner approves. Deny and expiry end `BLOCKED` / `blocked` with `approval_denied` or `approval_expired`.
-Cancelling while paused does not run the mutation. The idempotency key on the `tool_result` is the ledger key.
-
-`AWAITING_APPROVAL` is the state the workstream calls awaiting_approval. The enum stays in the same form as
-`EXECUTING` and the rest. `RETRY_PENDING` is not added here.
-
-## Readings (not decisions)
-
-- `policy.approvalRequirements` is a list of tool names. `external_write` needs approval even when the list is empty.
-- The approver role is `owner`. A runner, viewer, or cody-service principal is rejected and the request stays pending.
-- The grant lasts 24 hours unless the caller passes `ttlMs`. The PRD does not give a number.
-- A tool timeout or a thrown tool settles the ledger `failed` and is not dispatched again.
-- `recoverInterruptedRun` still marks a paused run `FAILED/internal_error`. Resuming it across a process is the queue workstream's checkpoint, not this ledger.
 # Phase 2 workstream C: trace and artifact retention
 
 PRD §20's hardened execution asks for retention of traces, artifacts and evaluations. DEC-05 is still open, so
@@ -409,15 +374,45 @@ holds, one `retention_pruned` audit event per deletion, redaction, and artifact 
   Artifact ids are `sha256:<hex>` of the content, the same form as Phase 0 `artifactRef`. A later put of the
   same bytes does not move `storedAt`.
 
+# Phase 2 workstream B: side-effect ledger and approval
+
+In-process only. No new dependency. Queue leases, checkpoints, retries and cancellation are a separate
+workstream, as are trace and artifact retention. The memory-off baseline does not construct this runtime, so
+its recorded trace is unchanged.
+
+| File | Purpose |
+|---|---|
+| `ledger.ts` | `SideEffectLedger`. A mutation is inserted as `intended` under `runId:step:intentHash` before it runs, then `committed` or `failed`. A second `intend` of the same key returns the existing row and the tool runner does not execute again, including while the first attempt is still `intended` (at-most-once). |
+| `approval.ts` | `ApprovalStore` / `ApprovalService`. A request records who asked, what would run, and the task scope. It closes once: `approved`, `denied`, or `expired`. Deny and expiry keep the reason and never grant the action. |
+| `tool-runner.ts` | `dispatchEffect`, the only path that performs a side effect once an `EffectRuntime` is wired. Every `external_write`, and any tool named in `policy.approvalRequirements`, is refused unless the store holds a matching unexpired grant. Reads are not ledgered. |
+| `access.ts` | The `approve` action is owner-only, separate from a memory `decide`, so the runner cannot approve its own call. |
+
+`ReferenceRunner` takes an optional `effects` bundle. Without it, a registered external write is still denied
+(`approval_required_p0` / `external_write_not_permitted`) and a tool listed in `approvalRequirements` blocks the
+run instead of running. With it, that call moves the run to `AWAITING_APPROVAL` and resumes to `EXECUTING` only
+after an owner approves. Deny and expiry end `BLOCKED` / `blocked` with `approval_denied` or `approval_expired`.
+Cancelling while paused does not run the mutation. The idempotency key on the `tool_result` is the ledger key.
+
+`AWAITING_APPROVAL` is the state the workstream calls awaiting_approval. The enum stays in the same form as
+`EXECUTING` and the rest. `RETRY_PENDING` is not added here.
+
+## Readings (not decisions)
+
+- `policy.approvalRequirements` is a list of tool names. `external_write` needs approval even when the list is empty.
+- The approver role is `owner`. A runner, viewer, or cody-service principal is rejected and the request stays pending.
+- The grant lasts 24 hours unless the caller passes `ttlMs`. The PRD does not give a number.
+- A tool timeout or a thrown tool settles the ledger `failed` and is not dispatched again.
+- `recoverInterruptedRun` still marks a bare paused run `FAILED/internal_error`. Under the durable worker a paused run resumes from its checkpoint (workstream A, "Paused for approval"). The approval and ledger records are in-memory, so a real process restart needs them durable too.
+
 ## Deferred
 
 | Not built | Why |
 |---|---|
-| Durable ledger and approval records | In-memory stand-in. Redis/BullMQ is DEC-03, and the queue workstream owns leases. |
-| HTTP approve/deny routes, tokens | §15 and §17.0 are still proposed defaults. The service is callable in process. |
-| Retry of an `intended` row after a crash | At-most-once: a crash between the record and the call is not distinguishable from a call that happened. |
-| Ledger rows inside the trace collections | The transition reason and the approval record hold why. Trace retention is the other workstream. |
 | Calling the sweeper from `ReferenceRunner` or sharing `InMemoryStore`'s maps | The runner and the six-collection store are shared seams; this workstream keeps its own store |
 | `retention_pruned` on the run trace, Atlas TTL indexes, object-storage lifecycle | DEC-08 and DEC-05; the audit log is the stand-in |
 | A retention TTL for the audit log itself | The log is what proves a prune; expiring it is a separate DEC-05 choice |
 | Redacting tool `argsSummary`, plan text or raw artifact bytes on the way in | Still the Phase 0 gap. Retention does not un-redact, and it does not start scrubbing |
+| Durable ledger and approval records | In-memory stand-in. Redis/BullMQ is DEC-03, and the queue workstream owns leases. |
+| HTTP approve/deny routes, tokens | §15 and §17.0 are still proposed defaults. The service is callable in process. |
+| Retry of an `intended` row after a crash | At-most-once: a crash between the record and the call is not distinguishable from a call that happened. |
+| Ledger rows inside the trace collections | The transition reason and the approval record hold why. Trace retention is the other workstream. |

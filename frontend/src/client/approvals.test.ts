@@ -5,6 +5,7 @@ import {
   approvalNotice,
   createMockApprovalsClient,
   parseApprovalStatus,
+  parseDecisionForm,
 } from "./approvals";
 
 const clock = () => "2026-02-02T00:00:00.000Z";
@@ -17,13 +18,14 @@ describe("parseApprovalStatus", () => {
     expect(parseApprovalStatus("all")).toEqual({ ok: true });
   });
 
-  it("accepts the three ledger statuses and rejects anything else", () => {
+  it("accepts the four ledger statuses and rejects anything else", () => {
     expect(parseApprovalStatus(" pending ")).toEqual({ ok: true, status: "pending" });
     expect(parseApprovalStatus("approved")).toEqual({ ok: true, status: "approved" });
     expect(parseApprovalStatus("denied")).toEqual({ ok: true, status: "denied" });
+    expect(parseApprovalStatus("expired")).toEqual({ ok: true, status: "expired" });
     expect(parseApprovalStatus("rejected")).toEqual({
       ok: false,
-      message: "Status must be pending, approved, or denied.",
+      message: "Status must be pending, approved, denied, or expired.",
     });
     expect(parseApprovalStatus(["pending", "denied"])).toEqual({
       ok: false,
@@ -39,6 +41,51 @@ describe("approvalNotice", () => {
     expect(approvalNotice("deleted", "apr-push-add")).toBeNull();
     expect(approvalNotice("approved", "run-1")).toBeNull();
     expect(approvalNotice(["approved"], "apr-push-add")).toBeNull();
+  });
+});
+
+describe("parseDecisionForm", () => {
+  const good = { id: "apr-1", decision: "approve", reason: "diff is local" };
+
+  it("accepts a decision and trims the reason", () => {
+    expect(parseDecisionForm(good)).toEqual({ ok: true, id: "apr-1", decision: "approve", reason: "diff is local" });
+    expect(parseDecisionForm({ ...good, decision: "deny", reason: "  wrong remote  " })).toEqual({
+      ok: true,
+      id: "apr-1",
+      decision: "deny",
+      reason: "wrong remote",
+    });
+  });
+
+  it("rejects a missing, non-text, or empty id, and an id over 128 characters", () => {
+    for (const id of [null, undefined, "", new File(["x"], "x.txt")]) {
+      expect(parseDecisionForm({ ...good, id })).toEqual({ ok: false, message: "Missing approval id." });
+    }
+    expect(parseDecisionForm({ ...good, id: "a".repeat(128) })).toMatchObject({ ok: true });
+    expect(parseDecisionForm({ ...good, id: "a".repeat(129) })).toEqual({ ok: false, message: "Approval id is too long." });
+  });
+
+  it("rejects anything but approve or deny", () => {
+    for (const decision of [null, undefined, "", "delete", "APPROVE"]) {
+      expect(parseDecisionForm({ ...good, decision })).toEqual({ ok: false, message: "Choose approve or deny." });
+    }
+  });
+
+  it("requires a reason and enforces the form's 240-character cap on the server", () => {
+    for (const reason of [null, undefined, "", "   "]) {
+      expect(parseDecisionForm({ ...good, reason })).toEqual({ ok: false, message: "A decision needs a reason." });
+    }
+    expect(parseDecisionForm({ ...good, reason: "r".repeat(240) })).toMatchObject({ ok: true });
+    expect(parseDecisionForm({ ...good, reason: `  ${"r".repeat(240)}  ` })).toMatchObject({ ok: true, reason: "r".repeat(240) });
+    expect(parseDecisionForm({ ...good, reason: "r".repeat(241) })).toEqual({
+      ok: false,
+      message: "A reason is at most 240 characters.",
+    });
+  });
+
+  it("reports the first problem in field order: id, then decision, then reason", () => {
+    expect(parseDecisionForm({ id: null, decision: null, reason: null })).toEqual({ ok: false, message: "Missing approval id." });
+    expect(parseDecisionForm({ id: "apr-1", decision: null, reason: null })).toEqual({ ok: false, message: "Choose approve or deny." });
   });
 });
 
