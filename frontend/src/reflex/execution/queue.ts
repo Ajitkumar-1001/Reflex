@@ -61,7 +61,8 @@ export interface JobQueue<T> {
   lease(input: LeaseInput): Promise<readonly JobLease<T>[]>;
   heartbeat(input: LeaseToken & { leaseMs: number }): Promise<Job<T>>;
   ack(input: LeaseToken): Promise<Job<T>>;
-  nack(input: LeaseToken & { error: string; backoffMs: number; deadLetter?: boolean }): Promise<{ job: Job<T>; disposition: "requeued" | "dead" }>;
+  /** `defer`: the job is waiting on something, not failing. It is queued again after `backoffMs` and `attempts` is unchanged. */
+  nack(input: LeaseToken & { error: string; backoffMs: number; deadLetter?: boolean; defer?: boolean }): Promise<{ job: Job<T>; disposition: "requeued" | "dead" }>;
   deadLetters(): Promise<readonly Job<T>[]>;
 }
 
@@ -181,15 +182,16 @@ export class InMemoryJobQueue<T> implements JobQueue<T> {
     return this.toJob(job);
   }
 
-  async nack(input: LeaseToken & { error: string; backoffMs: number; deadLetter?: boolean }): Promise<{ job: Job<T>; disposition: "requeued" | "dead" }> {
+  async nack(input: LeaseToken & { error: string; backoffMs: number; deadLetter?: boolean; defer?: boolean }): Promise<{ job: Job<T>; disposition: "requeued" | "dead" }> {
     finite("now", input.now);
     finite("backoffMs", input.backoffMs);
     if (input.backoffMs < 0) throw new Error("backoffMs must be non-negative");
     const job = this.requireActive(input.jobId, input.token, input.now);
-    job.attempts += 1;
+    const deferred = input.defer === true && input.deadLetter !== true;
+    if (!deferred) job.attempts += 1;
     job.lastError = input.error.slice(0, 300);
     job.lease = null;
-    if (input.deadLetter === true || job.attempts >= job.maxAttempts) {
+    if (input.deadLetter === true || (!deferred && job.attempts >= job.maxAttempts)) {
       job.state = "dead";
       job.deadLetteredAt = input.now;
       return { job: this.toJob(job), disposition: "dead" };

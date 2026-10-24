@@ -43,8 +43,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         </div>
         <footer className="border-t border-border">
           <p className="mx-auto w-full max-w-6xl px-4 py-4 text-xs leading-5 text-muted">
-            Read-only view of the Phase 1 in-memory store. Approve and deny call a mock side-effect ledger until that
-            service is wired.
+            Read-only view of the Phase 1 in-memory store. Approve and deny go through the in-memory Phase 2 approval
+            service.
           </p>
         </footer>
       </body>

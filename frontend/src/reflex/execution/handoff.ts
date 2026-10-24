@@ -18,6 +18,13 @@ export class WorkerCrash extends RunHandoff {
   }
 }
 
+/** The run is paused on an approval that is still pending. Nothing failed: the worker offers the job again later. */
+export class ApprovalPending extends RunHandoff {
+  constructor(readonly approvalId: string) {
+    super(`awaiting approval ${approvalId}`);
+  }
+}
+
 /** The lease token is unknown, expired, or already held by another worker. */
 export class LeaseLostError extends RunHandoff {
   constructor(message: string) {

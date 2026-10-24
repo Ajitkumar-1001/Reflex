@@ -71,6 +71,14 @@ describe("approval requests", () => {
     expect(approvals.get(request.id)?.status).toBe("approved");
   });
 
+  it("records the reason an owner gives when approving, and refuses a blank one", () => {
+    const approvals = service(new ManualClock(Date.UTC(2026, 0, 1)));
+    const request = approvals.request(subject);
+    expect(code(() => approvals.approve(as("owner"), request.id, "  "))).toBe("validation_error");
+    expect(approvals.get(request.id)?.status).toBe("pending");
+    expect(approvals.approve(as("owner"), request.id, "diff reviewed")).toMatchObject({ status: "approved", reason: "diff reviewed" });
+  });
+
   it("deny fails closed and records why", () => {
     const approvals = service(new ManualClock(Date.UTC(2026, 0, 1)));
     const request = approvals.request(subject);

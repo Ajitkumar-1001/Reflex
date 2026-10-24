@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { getApprovalsClient } from "@/client/approvals";
+import { getApprovalsClient } from "@/client/ledger-approvals";
 import { countsBy, formatRate } from "@/client/views";
 import { loadCatalog } from "./_components/load";
 import { PageHeader, StatusBadge } from "./_components/ui";

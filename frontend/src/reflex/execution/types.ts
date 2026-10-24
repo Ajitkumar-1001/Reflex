@@ -1,4 +1,4 @@
-import type { EvaluationResult, Plan, Run, RunEvent } from "../contracts";
+import type { EvaluationResult, Plan, Run, RunEvent, ToolCallRequest } from "../contracts";
 import type { MemoryCard, Observation } from "../ports";
 
 /**
@@ -9,6 +9,16 @@ import type { MemoryCard, Observation } from "../ports";
 
 /** Where a checkpoint sits. `terminal` is a finished run and is never executed again. */
 export type CheckpointPhase = "executing" | "evaluated" | "terminal";
+
+/**
+ * The tool call a run is paused on. The approval record keeps only a truncated `argsSummary`, so the
+ * call itself travels in the checkpoint and a resumed attempt does not ask the model again.
+ */
+export interface PendingApproval {
+  approvalId: string;
+  callId: string;
+  call: ToolCallRequest;
+}
 
 /**
  * Everything required to continue a run after the last completed step. Tool side effects that
@@ -32,6 +42,8 @@ export interface RunCheckpoint {
   executionFinished: boolean;
   cards: MemoryCard[];
   memoryBlock: string;
+  /** Present only while `run.status` is AWAITING_APPROVAL. Absent on every other checkpoint. */
+  awaiting?: PendingApproval;
 }
 
 /** What the runner calls. The worker implements it with a checkpoint store and the live lease. */

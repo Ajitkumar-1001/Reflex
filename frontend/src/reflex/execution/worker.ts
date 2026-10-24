@@ -6,7 +6,7 @@ import { ReferenceRunner } from "../runner";
 import type { RunnerDeps } from "../runner";
 import { InMemoryCheckpointStore } from "./checkpoint";
 import type { CheckpointStore } from "./checkpoint";
-import { LeaseLostError, WorkerCrash } from "./handoff";
+import { ApprovalPending, LeaseLostError, WorkerCrash } from "./handoff";
 import { DEFAULT_MAX_ATTEMPTS, InMemoryJobQueue, exponentialBackoff } from "./queue";
 import type { Job, JobLease, JobQueue } from "./queue";
 import type { RunCheckpoint, RunExecution } from "./types";
@@ -44,6 +44,8 @@ export type TickResult =
   | { kind: "done"; dispatchId: string }
   | { kind: "crashed"; dispatchId: string }
   | { kind: "lost"; dispatchId: string }
+  /** The run is paused on a pending approval. The job is offered again at `availableAt`; no attempt is charged. */
+  | { kind: "paused"; dispatchId: string; availableAt: number }
   | { kind: "ack_failed"; dispatchId: string }
   | { kind: "requeued"; dispatchId: string; attempts: number; availableAt: number }
   | { kind: "dead"; dispatchId: string; attempts: number };
@@ -71,8 +73,9 @@ function copyWorkspace(workspace: Workspace): InMemoryWorkspace {
 
 /**
  * Leases one run at a time and drives the reference runner. A crash (WorkerCrash) does not ack or
- * nack: the lease expires and the next worker loads the last checkpoint. Any other throw is a
- * failed attempt with backoff, and the attempt cap dead-letters the job.
+ * nack: the lease expires and the next worker loads the last checkpoint. A run paused on a pending
+ * approval (ApprovalPending) is deferred without charging an attempt. Any other throw is a failed
+ * attempt with backoff, and the attempt cap dead-letters the job.
  */
 export class DurableExecutor {
   readonly queue: JobQueue<RunJobPayload>;
@@ -145,6 +148,8 @@ export class DurableExecutor {
     } catch (error) {
       if (error instanceof LeaseLostError) return { kind: "lost", dispatchId };
       if (error instanceof WorkerCrash) return { kind: "crashed", dispatchId };
+      // ponytail: re-offered at the base backoff, not woken by the decision. Add a wake-up when the real queue lands (DEC-03).
+      if (error instanceof ApprovalPending) return this.fail(lease, error.message, false, true);
       return this.fail(lease, error instanceof Error ? error.message : "job failed", false);
     }
     if (!result.admitted) {
@@ -164,7 +169,8 @@ export class DurableExecutor {
     return { kind: "done", dispatchId };
   }
 
-  private async fail(lease: JobLease<RunJobPayload>, error: string, deadLetter: boolean): Promise<TickResult> {
+  /** Gives the lease back. A failed attempt is charged and backs off; `defer` is a wait on an approval and is not charged. */
+  private async fail(lease: JobLease<RunJobPayload>, error: string, deadLetter: boolean, defer = false): Promise<TickResult> {
     const dispatchId = lease.job.payload.dispatchId;
     try {
       const nacked = await this.queue.nack({
@@ -172,9 +178,11 @@ export class DurableExecutor {
         token: lease.token,
         now: this.at,
         error,
-        backoffMs: this.backoffMs(lease.job.attempts + 1),
+        backoffMs: this.backoffMs(defer ? 1 : lease.job.attempts + 1),
         deadLetter,
+        defer,
       });
+      if (defer) return { kind: "paused", dispatchId, availableAt: nacked.job.availableAt };
       if (nacked.disposition === "dead") return { kind: "dead", dispatchId, attempts: nacked.job.attempts };
       return { kind: "requeued", dispatchId, attempts: nacked.job.attempts, availableAt: nacked.job.availableAt };
     } catch (nackError) {
